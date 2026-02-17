@@ -1,0 +1,37 @@
+name = "code-refinery"
+main = "src/index.ts"
+compatibility_date = "2025-02-01"
+
+# Queue — producer
+[[queues.producers]]
+binding = "REVIEW_QUEUE"
+queue = "pr-review-jobs"
+
+# Queue — consumer
+[[queues.consumers]]
+queue = "pr-review-jobs"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "pr-review-jobs-dlq"
+
+# D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "code-refinery-db"
+database_id = "placeholder-will-be-replaced-after-d1-create"
+
+# Durable Objects — SandboxContainer
+[durable_objects]
+bindings = [
+  { name = "SANDBOX", class_name = "SandboxContainer" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SandboxContainer"]
+
+# Container
+[[containers]]
+class_name = "SandboxContainer"
+image = "./container/Dockerfile"
+max_instances = 5
