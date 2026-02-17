@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
-    "@cloudflare/containers": "^0.1.0"
+    "@cloudflare/sandbox": "^0.1.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250201.0",

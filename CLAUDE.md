@@ -1,6 +1,6 @@
 # Code Refinery
 
-PR review agent built on Cloudflare Workers, Containers, Queues, AI Gateway, and the Anthropic SDK. Uses a GitHub App for webhooks. React dashboard on Cloudflare Pages.
+PR review agent built on Cloudflare Workers, Sandbox SDK, Queues, AI Gateway, and the Anthropic SDK. Uses a GitHub App for webhooks. React dashboard on Cloudflare Pages.
 
 ## Rules
 
@@ -27,9 +27,10 @@ PR review agent built on Cloudflare Workers, Containers, Queues, AI Gateway, and
                     Queue (jobs)   D1 (data)    AI Gateway
                          │          │          (Anthropic)
                          ▼          │             │
-                    Container       │             │
-                    (sandbox)◄──────┼─────────────┘
-                                    │
+                    Sandbox (SDK)   │             │
+                    sandbox.exec()  │             │
+                    sandbox.read◄───┼─────────────┘
+                    File()          │
                               ┌─────┘
                               ▼
                          D1 Database
@@ -37,11 +38,10 @@ PR review agent built on Cloudflare Workers, Containers, Queues, AI Gateway, and
                      traces, settings)
 ```
 
-### Three Deployables
+### Two Deployables
 
-1. **Worker** (`src/`) — webhook handler, queue consumer, dashboard API, OAuth. Single `wrangler deploy`.
+1. **Worker** (`src/`) — webhook handler, queue consumer, dashboard API, OAuth. Single `wrangler deploy`. Sandbox container image built automatically.
 2. **Dashboard** (`dashboard/`) — React SPA on Cloudflare Pages. `npm run build && wrangler pages deploy`.
-3. **Container** (`container/`) — Docker image for sandboxed tool execution. Built automatically on `wrangler deploy`.
 
 ### Data Flow
 
@@ -53,8 +53,8 @@ GitHub Webhook (PR opened/synchronized)
       1. getInstallationToken() — JWT + exchange
       2. getPRDiff() — GitHub API with Accept: application/vnd.github.diff
       3. getSandbox(env.SANDBOX, "owner/repo") — keyed by repo for warm clones
-      4. executeInContainer("/setup", {cloneUrl, headRef, token}) — clone or fetch+checkout
-      5. runAgentLoop() — while(has_tool_calls) Anthropic API ↔ container tools
+      4. sandbox.exec("git clone ...") or sandbox.exec("git fetch && git checkout") — clone or update
+      5. runAgentLoop() — while(has_tool_calls) Anthropic API ↔ sandbox.exec() / sandbox.readFile()
       6. postReview() — GitHub PR review API
       7. message.ack()
 ```
@@ -67,18 +67,19 @@ GitHub Webhook (PR opened/synchronized)
 | Dashboard | React SPA on Pages | Separate deploy cycle. Pages = free hosting + global CDN |
 | Auth | GitHub OAuth | Users are GitHub users. SSO, no password management |
 | Database | Cloudflare D1 | Native binding, zero-latency from Worker, SQL |
-| Agent loop | Manual while-loop | Full control over container routing, timeouts, trace logging |
-| Container keying | Per repo (`owner/repo`) | Warm clones — 2nd+ review skips clone (~15s faster). 30m sleep |
+| Sandbox | Cloudflare Sandbox SDK (`@cloudflare/sandbox`) | Built on Containers but no custom server needed — provides exec(), readFile(), writeFile() out of the box |
+| Agent loop | Manual while-loop | Full control over sandbox tool routing, timeouts, trace logging |
+| Sandbox keying | Per repo (`owner/repo`) | Warm clones — 2nd+ review skips clone (~15s faster). 10m default sleep |
 | Command execution | Allowlisted only | Security — no arbitrary code from untrusted PRs |
 | Model | claude-sonnet-4-5 | Balance of speed and quality for reviews |
 | Review output | `<review>` JSON tags | Reliable parsing with reasoning preamble |
 | Payments | Stubbed for later | Usage tracking in D1 from day 1 so billing data is ready |
-| gh CLI | Not used | All GitHub API via fetch() in Worker. Smaller container |
+| gh CLI | Not used | All GitHub API via fetch() in Worker. Smaller container image |
 | Cloudflare agents-sdk | Not used | Designed for client-facing chat agents. We're webhook-driven, backend-only |
 
-### Warm Container Strategy
+### Warm Sandbox Strategy
 
-Containers keyed by **repo** (not PR). Durable Object keeps container alive 30 minutes after last use. First review pays clone cost (~10-20s). Subsequent reviews do `git fetch && git checkout` (~2-3s). DO is near-free when idle (CPU time only, not wall-clock).
+Sandboxes keyed by **repo** (not PR). Durable Object keeps sandbox alive after last use (default 10 minutes, configurable via `sleepAfter`). First review pays clone cost (~10-20s). Subsequent reviews do `git fetch && git checkout` (~2-3s). DO is near-free when idle (CPU time only, not wall-clock).
 
 ---
 
@@ -86,7 +87,7 @@ Containers keyed by **repo** (not PR). Durable Object keeps container alive 30 m
 
 ```
 src/                                 ── Worker (webhook + API + queue consumer)
-  index.ts                           — Entry point, route dispatch, Env type
+  index.ts                           — Entry point, route dispatch, Env type, re-exports Sandbox
   router.ts                          — Webhook signature verification + event routing
   github/
     auth.ts                          — JWT generation (RS256 via Web Crypto), installation token exchange
@@ -94,10 +95,10 @@ src/                                 ── Worker (webhook + API + queue consum
     types.ts                         — Webhook payload + ReviewJob types
   agent/
     loop.ts                          — Agentic while-loop (core brain)
-    tools.ts                         — Tool definitions for Anthropic API + endpoint mapping
+    tools.ts                         — Tool definitions for Anthropic API + sandbox routing
     prompts.ts                       — System prompt, review checklist, ReviewConfig
-  container/
-    binding.ts                       — SandboxContainer class + helpers
+  sandbox/
+    helpers.ts                       — getSandbox() wrapper, setupRepo(), command allowlist
   api/                               ── Dashboard REST API
     auth.ts                          — GitHub OAuth flow (login, callback, session)
     repos.ts                         — GET /api/repos, PATCH /api/repos/:id/settings
@@ -107,11 +108,7 @@ src/                                 ── Worker (webhook + API + queue consum
   db/
     schema.ts                        — D1 table definitions (migrations)
     queries.ts                       — Typed query helpers
-container/                           ── Sandbox Docker image
-  Dockerfile                         — node:20-slim + git + jq + curl
-  server.ts                          — Express server: /setup, /tool/*, /health
-  package.json
-  tsconfig.json
+Dockerfile                           — Sandbox image: node:20-slim + git + jq + curl (no server)
 dashboard/                           ── React SPA (Cloudflare Pages)
   src/
     App.tsx                          — Router + layout
@@ -145,16 +142,15 @@ package.json
 ### Phase 1: Project Scaffold ✅
 Create all config files and stubs so `npm install && npx wrangler dev` works.
 
-- `package.json` — deps: `@anthropic-ai/sdk`, `@cloudflare/containers`; devDeps: `wrangler`, `@cloudflare/workers-types`, `typescript`
+- `package.json` — deps: `@anthropic-ai/sdk`, `@cloudflare/sandbox`; devDeps: `wrangler`, `@cloudflare/workers-types`, `typescript`
 - `tsconfig.json` — target ES2022, module ES2022, bundler resolution, Workers types
-- `wrangler.toml` — queue producer/consumer, container (`[[containers]]` array syntax, requires `image` field), D1 binding, DO binding
+- `wrangler.toml` — queue producer/consumer, `[[containers]]` with Sandbox class, D1 binding, DO binding with `new_sqlite_classes`
 - `.gitignore`, `.dev.vars`
-- `src/index.ts` — stub fetch + queue handlers, Env interface, re-exports SandboxContainer
-- `src/container/binding.ts` — SandboxContainer extends Container (defaultPort, sleepAfter, enableInternet)
-- `container/` — Dockerfile (node:20-slim + git/jq/curl), server.ts (Express /health), package.json, tsconfig.json
+- `src/index.ts` — stub fetch + queue handlers, Env interface, re-exports Sandbox
+- `Dockerfile` (root) — node:20-slim + git/jq/curl (no server, just the environment)
 - `scripts/stringify-pem.sh` — converts PKCS8 PEM to single-line string for .dev.vars
 
-**Verified:** `npm install` ✅, `npx wrangler dev` ✅, `curl localhost:8787` → 200 ✅, container `tsc` compiles ✅.
+**Verified:** `npm install` ✅, `npx wrangler dev` ✅, `curl localhost:8787` → 200 ✅.
 
 ### Phase 2: Router Worker (Webhook Handler) ✅
 - `src/github/types.ts` — PullRequestEvent, ReviewJob interfaces (lean, only fields consumed downstream)
@@ -180,25 +176,24 @@ Create all config files and stubs so `npm install && npx wrangler dev` works.
 
 **Verify:** Test endpoint generates JWT, gets token, fetches diff, posts review.
 
-### Phase 4: Container Setup
-- `container/Dockerfile` — node:20-slim, git+jq+curl, Express server
-- `container/server.ts` — port 3000:
-  - `POST /setup` — if not cloned: clone with token auth. If cloned: `git fetch`. Then `git checkout headRef`
-  - `POST /tool/read_file` — path traversal prevention, optional line range
-  - `POST /tool/run_command` — allowlist: npm test, npm run lint, npx tsc --noEmit, git log, git show
-  - `POST /tool/list_files` — `git ls-files` + regex filter
-  - `POST /tool/git_diff` — `git diff {baseSha}...HEAD`
-  - `GET /health`
-- `src/container/binding.ts` — SandboxContainer (enableInternet=true, port 3000, sleep 30m), getSandbox(), executeInContainer()
+### Phase 4: Sandbox Setup
+- `Dockerfile` (root) — node:20-slim + git + jq + curl. No Express server — Sandbox SDK handles all communication.
+- `src/sandbox/helpers.ts`:
+  - `setupRepo(sandbox, cloneUrl, headRef, token)` — `sandbox.exec("git clone ...")` or `sandbox.exec("git fetch && git checkout ...")`
+  - `readFile(sandbox, path)` — `sandbox.readFile(path)` with path validation
+  - `runCommand(sandbox, cmd)` — allowlisted commands only via `sandbox.exec(cmd)`
+  - `listFiles(sandbox, pattern?)` — `sandbox.exec("git ls-files")` with optional filter
+  - `gitDiff(sandbox, baseSha)` — `sandbox.exec("git diff baseSha...HEAD")`
+  - Command allowlist: npm test, npm run lint, npx tsc --noEmit, git log, git show
 
-**Verify:** Docker build + run locally. Test /health, /setup, /tool/* against public repo.
+**Verify:** Deploy, sandbox.exec("git --version") returns output. Clone a public repo, read files.
 
 ### Phase 5: Agent Loop (Core)
-- `src/agent/tools.ts` — Tool definitions (read_file, list_files, run_command, git_diff), endpoint map, input key mapping
+- `src/agent/tools.ts` — Tool definitions (read_file, list_files, run_command, git_diff) + sandbox routing (tool_name → helper function)
 - `src/agent/prompts.ts` — System prompt (review role, checklist, output format with `<review>` JSON), buildUserMessage()
-- `src/agent/loop.ts` — `runAgentLoop(job, diff, container, apiKey, gatewayUrl)`:
+- `src/agent/loop.ts` — `runAgentLoop(job, diff, sandbox, apiKey, gatewayUrl)`:
   - Anthropic client with AI Gateway baseURL
-  - While loop (max 20 iterations): messages.create → if end_turn: parse review → if tool_use: execute in container, collect results, continue
+  - While loop (max 20 iterations): messages.create → if end_turn: parse review → if tool_use: call sandbox helper, collect results, continue
 - `src/index.ts` — full queue handler wiring everything together
 
 **Verify:** Deploy, open PR on test repo, review appears on PR within 30-60s.
@@ -271,7 +266,7 @@ Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Ga
 - **Runtime:** Cloudflare Workers (TypeScript)
 - **Queue:** Cloudflare Queues
 - **Database:** Cloudflare D1 (SQLite)
-- **Containers:** Cloudflare Containers (Docker, Durable Objects)
+- **Sandbox:** Cloudflare Sandbox SDK (`@cloudflare/sandbox`) — built on Containers, provides exec/readFile/writeFile
 - **AI:** Anthropic Claude Sonnet 4.5 via AI Gateway
 - **Frontend:** React + Vite on Cloudflare Pages
 - **Auth:** GitHub OAuth
@@ -279,17 +274,18 @@ Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Ga
 
 ## Conventions
 
-- All GitHub API calls happen in the Worker via fetch(), never in the container
-- Container only runs local operations: file reads, git commands, allowlisted shell commands
-- Private keys stored as Cloudflare secrets, passed to container only as short-lived installation tokens
+- All GitHub API calls happen in the Worker via fetch(), never in the sandbox
+- Sandbox only runs local operations: file reads, git commands, allowlisted shell commands via `sandbox.exec()`
+- Private keys stored as Cloudflare secrets, passed to sandbox only as short-lived installation tokens
 - Agent loop capped at 20 iterations with structured `<review>` JSON output
 - D1 tracks every agent turn for observability (review_traces table)
 
 ### Wrangler / Cloudflare Conventions
 - `[[containers]]` uses double-bracket (array) TOML syntax, not `[containers]`
-- Container config requires `image` field pointing to Dockerfile path (e.g. `"./container/Dockerfile"`)
+- Container config requires `image` field pointing to Dockerfile path (e.g. `"./Dockerfile"`)
 - `disk_size_gb` is not a valid container field in wrangler — omit it
 - Local dev without Docker: use `--enable-containers=false` flag with `wrangler dev`
-- SandboxContainer must be re-exported from the Worker entry point (`src/index.ts`) for DO binding
+- Sandbox class must be re-exported from the Worker entry point (`src/index.ts`) for DO binding: `export { Sandbox } from "@cloudflare/sandbox"`
+- Sandbox DO migration uses `new_sqlite_classes` (not `new_classes`) — required by Sandbox SDK
 - `.dev.vars` secrets auto-loaded by wrangler dev as environment variables
 - PEM keys in `.dev.vars`: use `scripts/stringify-pem.sh` to convert multi-line PEM to single-line

@@ -1,7 +1,6 @@
-import { SandboxContainer } from "./container/binding";
 import { handleWebhook } from "./router";
 
-export { SandboxContainer };
+export { Sandbox } from "@cloudflare/sandbox";
 
 export interface Env {
   // Cloudflare bindings

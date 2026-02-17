@@ -54,3 +54,12 @@ export interface ReviewJob {
   installationId: number;
   enqueuedAt: string;
 }
+
+export interface ReviewComment {
+  path: string;
+  line: number;
+  start_line?: number;
+  side?: "LEFT" | "RIGHT";
+  start_side?: "LEFT" | "RIGHT";
+  body: string;
+}
