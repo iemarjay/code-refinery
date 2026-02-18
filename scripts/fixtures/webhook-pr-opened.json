@@ -1,0 +1,42 @@
+{
+  "action": "opened",
+  "number": 1,
+  "pull_request": {
+    "number": 1,
+    "title": "Add marketing agent knowledge base",
+    "body": "## Summary\n- Adds a comprehensive marketing knowledge base document (`marketing.md`) for use by marketing agents\n- Covers brand voice, audience personas, platform-specific strategies, competitive intelligence, and localized copy templates (Pidgin, Sheng, Nouchi) across all target ECOWAS markets\n\n## Test plan\n- [x] Document reviewed for accuracy against current platform features\n- [ ] Verify no sensitive data is included\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "user": {
+      "login": "iemarjay",
+      "id": 13520740
+    },
+    "head": {
+      "ref": "add-marketing-knowledge-base",
+      "sha": "d49ffa613674e52c37ca244dadb8d691b14c604f"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "bfa2c3e7c30a8d91e1b774e68ef1c9134221e592"
+    },
+    "draft": false,
+    "state": "open"
+  },
+  "repository": {
+    "id": 1158805063,
+    "full_name": "amp10-technologies/pulsepanel",
+    "name": "pulsepanel",
+    "owner": {
+      "login": "amp10-technologies",
+      "id": 206539364
+    },
+    "clone_url": "https://github.com/amp10-technologies/pulsepanel.git",
+    "default_branch": "main",
+    "private": true
+  },
+  "installation": {
+    "id": 110028887
+  },
+  "sender": {
+    "login": "iemarjay",
+    "id": 13520740
+  }
+}

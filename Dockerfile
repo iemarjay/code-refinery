@@ -1,5 +1,9 @@
-FROM node:20-slim
+FROM docker.io/cloudflare/sandbox:0.1.4
 
-RUN apt-get update && apt-get install -y git jq curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ripgrep \
+  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace
+RUN mkdir -p /workspace
+
+EXPOSE 3000

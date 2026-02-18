@@ -49,14 +49,15 @@ PR review agent built on Cloudflare Workers, Sandbox SDK, Queues, AI Gateway, an
 GitHub Webhook (PR opened/synchronized)
   → fetch() handler: verify HMAC-SHA256 signature, enqueue ReviewJob
   → Cloudflare Queue (pr-review-jobs, batch_size=1, max_retries=3)
-  → queue() handler:
+  → queue() handler: validateReviewJob() → executeReview(job, env):
       1. getInstallationToken() — JWT + exchange
-      2. getPRDiff() — GitHub API with Accept: application/vnd.github.diff
-      3. getSandbox(env.SANDBOX, "owner/repo") — keyed by repo for warm clones
-      4. sandbox.exec("git clone ...") or sandbox.exec("git fetch && git checkout") — clone or update
-      5. runAgentLoop() — while(has_tool_calls) Anthropic API ↔ sandbox.exec() / sandbox.readFile()
-      6. postReview() — GitHub PR review API
-      7. message.ack()
+      2. getSandboxForRepo(env.SANDBOX, "owner/repo") — keyed by owner--repo for warm clones
+      3. setupRepo(sandbox, cloneUrl, headRef, headSha, token) — clone (--depth=50) or fetch+checkout+reset
+      4. getPRDiff() — GitHub API with Accept: application/vnd.github.diff
+      5. composeSkills(changedFiles, job) — select skills, build system prompt, collect tools
+      6. runAgentLoop() — while(has_tool_calls) Anthropic API ↔ sandbox.exec() / sandbox.readFile()
+      7. postReview() — GitHub PR review API
+      8. message.ack()
 ```
 
 ### Key Design Decisions
@@ -69,17 +70,21 @@ GitHub Webhook (PR opened/synchronized)
 | Database | Cloudflare D1 | Native binding, zero-latency from Worker, SQL |
 | Sandbox | Cloudflare Sandbox SDK (`@cloudflare/sandbox`) | Built on Containers but no custom server needed — provides exec(), readFile(), writeFile() out of the box |
 | Agent loop | Manual while-loop | Full control over sandbox tool routing, timeouts, trace logging |
-| Sandbox keying | Per repo (`owner/repo`) | Warm clones — 2nd+ review skips clone (~15s faster). 10m default sleep |
-| Command execution | Allowlisted only | Security — no arbitrary code from untrusted PRs |
-| Model | claude-sonnet-4-5 | Balance of speed and quality for reviews |
+| Sandbox keying | Per repo (`owner--repo`) | Warm clones — 2nd+ review skips clone (~15s faster). 10m default sleep |
+| Clone strategy | `--depth=50` shallow clone | Fast first clone; enough history for most diffs. Agent falls back to GitHub API diff if baseSha not in history |
+| Repo directory | `/workspace/repo` (not root) | Keeps workspace clean, avoids conflicts with container WORKDIR |
+| Command execution | Allowlisted only (prefix-based) | Security — no arbitrary code from untrusted PRs. `runCommand` returns raw result (no throw on non-zero) so agent sees test failures |
+| Skills system | Composable skill modules | Each skill = metadata (file patterns, priority, required tools) + instructions. Composer selects skills by matching changed files, builds unified system prompt |
+| Model | claude-sonnet-4-5-20250929 | Balance of speed and quality for reviews |
 | Review output | `<review>` JSON tags | Reliable parsing with reasoning preamble |
 | Payments | Stubbed for later | Usage tracking in D1 from day 1 so billing data is ready |
+| Sandbox image | `cloudflare/sandbox:0.1.4` + ripgrep | Official sandbox base image with built-in server; ripgrep for `searchContent()` |
 | gh CLI | Not used | All GitHub API via fetch() in Worker. Smaller container image |
 | Cloudflare agents-sdk | Not used | Designed for client-facing chat agents. We're webhook-driven, backend-only |
 
 ### Warm Sandbox Strategy
 
-Sandboxes keyed by **repo** (not PR). Durable Object keeps sandbox alive after last use (default 10 minutes, configurable via `sleepAfter`). First review pays clone cost (~10-20s). Subsequent reviews do `git fetch && git checkout` (~2-3s). DO is near-free when idle (CPU time only, not wall-clock).
+Sandboxes keyed by **repo** (not PR), using `owner--repo` as DO ID. Durable Object keeps sandbox alive after last use (default 10 minutes, configurable via `sleepAfter`). First review pays shallow clone cost (`--depth=50`, ~10-20s). Subsequent reviews: update remote URL (fresh token) → `git fetch` → `git checkout -B` → `git reset --hard` → `git clean -fd` (~2-3s). DO is near-free when idle (CPU time only, not wall-clock).
 
 ---
 
@@ -94,11 +99,21 @@ src/                                 ── Worker (webhook + API + queue consum
     api.ts                           — PR diff, post review, post comment
     types.ts                         — Webhook payload + ReviewJob types
   agent/
-    loop.ts                          — Agentic while-loop (core brain)
-    tools.ts                         — Tool definitions for Anthropic API + sandbox routing
-    prompts.ts                       — System prompt, review checklist, ReviewConfig
+    review.ts                        — executeReview() orchestrator (auth → sandbox → diff → skills → loop → post)
+    loop.ts                          — Agentic while-loop (core brain), ReviewResult/ReviewFinding/AgentTrace types
+    tools.ts                         — Tool definitions for Anthropic API + routeToolCall() dispatcher
+    skills/
+      types.ts                       — SandboxToolName, SkillMetadata, Skill, SkillComposition interfaces
+      composer.ts                    — composeSkills(), buildSystemPrompt(), extractChangedFiles()
+      builtin/
+        index.ts                     — BUILTIN_SKILLS map (all 5 skills)
+        security-review.ts           — Injection, auth bypass, secrets, SSRF (priority 10)
+        bug-detection.ts             — Null errors, off-by-one, race conditions (priority 20)
+        architecture-review.ts       — Patterns, coupling, API design (priority 30)
+        code-quality.ts              — Readability, complexity, dead code (priority 40)
+        data-flow-analysis.ts        — Data flow tracing, taint analysis (priority 50)
   sandbox/
-    helpers.ts                       — getSandbox() wrapper, setupRepo(), command allowlist
+    helpers.ts                       — getSandboxForRepo(), setupRepo(), readFile(), runCommand(), listFiles(), gitDiff(), searchContent(), findFiles(), SandboxError
   api/                               ── Dashboard REST API
     auth.ts                          — GitHub OAuth flow (login, callback, session)
     repos.ts                         — GET /api/repos, PATCH /api/repos/:id/settings
@@ -108,7 +123,7 @@ src/                                 ── Worker (webhook + API + queue consum
   db/
     schema.ts                        — D1 table definitions (migrations)
     queries.ts                       — Typed query helpers
-Dockerfile                           — Sandbox image: node:20-slim + git + jq + curl (no server)
+Dockerfile                           — Sandbox image: cloudflare/sandbox + ripgrep (no server)
 dashboard/                           ── React SPA (Cloudflare Pages)
   src/
     App.tsx                          — Router + layout
@@ -164,39 +179,67 @@ Create all config files and stubs so `npm install && npx wrangler dev` works.
 
 **Verified:** `npx tsc --noEmit` ✅. Missing signature → 401, invalid signature → 401, non-PR events → 200 ignored, valid PR opened → 200 + enqueue.
 
-### Phase 3: GitHub Auth Module
+### Phase 3: GitHub Auth Module ✅
 - `src/github/auth.ts`:
-  - `pemToArrayBuffer(pem)` — strip headers, base64 → ArrayBuffer
+  - `pemToArrayBuffer(pem)` — strip headers, validate PKCS#8 (reject PKCS#1 with conversion hint), base64 → ArrayBuffer
   - `generateAppJwt(appId, pem)` — RS256 via `crypto.subtle.importKey("pkcs8")` + `crypto.subtle.sign("RSASSA-PKCS1-v1_5")`; iss=appId, iat=now-60, exp=now+600
   - `getInstallationToken(appId, pem, installationId)` — POST `/app/installations/{id}/access_tokens`
 - `src/github/api.ts`:
   - `getPRDiff(token, owner, repo, prNumber)` — Accept: application/vnd.github.diff
-  - `postReview(token, owner, repo, prNumber, body, comments, event)` — POST /pulls/{n}/reviews
+  - `postReview(token, owner, repo, prNumber, body, comments, event, commitId)` — POST /pulls/{n}/reviews (includes commit_id for multi-commit PRs)
   - `postComment(token, owner, repo, issueNumber, body)` — POST /issues/{n}/comments
+- `src/github/types.ts` — Added ReviewComment interface (path, line, start_line, side, body)
+- Migrated from `@cloudflare/containers` to `@cloudflare/sandbox` SDK — removed `/container/` directory, simplified Dockerfile, updated wrangler.toml
 
-**Verify:** Test endpoint generates JWT, gets token, fetches diff, posts review.
+**Verified:** `npx tsc --noEmit` ✅.
 
-### Phase 4: Sandbox Setup
-- `Dockerfile` (root) — node:20-slim + git + jq + curl. No Express server — Sandbox SDK handles all communication.
+### Phase 4: Sandbox Setup ✅
+- `Dockerfile` (root) — base image `cloudflare/sandbox:0.1.4` + ripgrep; `EXPOSE 3000`; `/workspace` directory
 - `src/sandbox/helpers.ts`:
-  - `setupRepo(sandbox, cloneUrl, headRef, token)` — `sandbox.exec("git clone ...")` or `sandbox.exec("git fetch && git checkout ...")`
-  - `readFile(sandbox, path)` — `sandbox.readFile(path)` with path validation
-  - `runCommand(sandbox, cmd)` — allowlisted commands only via `sandbox.exec(cmd)`
-  - `listFiles(sandbox, pattern?)` — `sandbox.exec("git ls-files")` with optional filter
-  - `gitDiff(sandbox, baseSha)` — `sandbox.exec("git diff baseSha...HEAD")`
-  - Command allowlist: npm test, npm run lint, npx tsc --noEmit, git log, git show
+  - `SandboxError` — custom error class with command, exitCode, stderr for diagnostics
+  - `getSandboxForRepo(ns, repoFullName)` — wraps `getSandbox()`, keys by `owner--repo` for warm clones
+  - `setupRepo(sandbox, cloneUrl, headRef, headSha, token)` — warm path: update remote URL + fetch specific branch (falls back to SHA for fork PRs) + checkout + reset + clean; cold path: `git clone --depth=50`; token injected via URL constructor; **strips token from remote URL after setup** for security
+  - `readFile(sandbox, path)` — `sandbox.readFile(path)` with path normalization and traversal validation (must be under `/workspace/repo/`)
+  - `runCommand(sandbox, cmd)` — shell metacharacter rejection + prefix-based allowlist check, does NOT throw on non-zero exit (agent loop needs failure output)
+  - `listFiles(sandbox, pattern?)` — `git ls-files` with shell metacharacter validation on pattern
+  - `gitDiff(sandbox, baseSha)` — `git diff baseSha...HEAD` with SHA format validation
+  - `searchContent(sandbox, pattern, options?)` — wraps ripgrep (`rg`) with input validation; returns empty string for no matches (rg exit 1 = no matches)
+  - `findFiles(sandbox, pattern, options?)` — wraps `find` with pattern validation and max depth limit (default 10, max 15)
+  - Internal helpers: `shellQuote()` for safe quoting, `scrubTokens()` to redact credentials from logs, `SAFE_GIT_REF_RE`/`SAFE_SHA_RE` for input validation
+  - Command allowlist (multi-language): JS/TS (npm test, npm run lint, npx tsc), Python (pytest, ruff, mypy), Go (go test, go vet), Rust (cargo test, cargo clippy), Ruby (bundle exec rake/rubocop), Java (gradlew, mvnw, mvn), generic (make test/lint), git commands. rg/find NOT in allowlist — only accessible via `searchContent()`/`findFiles()`
+- `src/index.ts` — `validateReviewJob()` runtime validation of queue messages; queue handler calls `executeReview(job, env)`; `Env.SANDBOX` typed as `DurableObjectNamespace<Sandbox>`; added `CLOUDFLARE_ACCOUNT_ID` and `AI_GATEWAY_ID` to Env
 
-**Verify:** Deploy, sandbox.exec("git --version") returns output. Clone a public repo, read files.
+**Verified:** `npx tsc --noEmit` ✅.
 
-### Phase 5: Agent Loop (Core)
-- `src/agent/tools.ts` — Tool definitions (read_file, list_files, run_command, git_diff) + sandbox routing (tool_name → helper function)
-- `src/agent/prompts.ts` — System prompt (review role, checklist, output format with `<review>` JSON), buildUserMessage()
-- `src/agent/loop.ts` — `runAgentLoop(job, diff, sandbox, apiKey, gatewayUrl)`:
-  - Anthropic client with AI Gateway baseURL
-  - While loop (max 20 iterations): messages.create → if end_turn: parse review → if tool_use: call sandbox helper, collect results, continue
-- `src/index.ts` — full queue handler wiring everything together
+### Phase 5: Agent Loop (Core) ✅
+- `src/agent/tools.ts` — Tool definitions (read_file, list_files, run_command, git_diff, search_content, find_files) + `routeToolCall()` dispatcher with output capping (30k chars for commands/search, 50k for diffs)
+- `src/agent/loop.ts` — `runAgentLoop(job, diff, sandbox, composition, apiKey, gatewayBaseUrl?)`:
+  - Anthropic client with optional AI Gateway baseURL
+  - Model: `claude-sonnet-4-5-20250929`, max_tokens: 16384, temperature: 0
+  - While loop (max 20 iterations): messages.create → end_turn: extract `<review>` JSON → tool_use: route to sandbox → max_tokens: ask for summary
+  - `ReviewResult` (verdict, summary, findings), `ReviewFinding` (skill, severity, path, line, title, body), `AgentTrace` (turns, tokens, duration)
+  - `buildUserMessage()` — formats PR diff (capped at 100k chars)
+  - `parseReviewJson()` — extracts JSON from `<review>` tags, handles markdown code fences, validates verdict/findings
+  - Fallback: on max iterations, walks backward through messages to find any `<review>` block
+- `src/agent/review.ts` — `executeReview(job, env)` orchestrates the full flow: auth → sandbox setup → getPRDiff → extractChangedFiles → composeSkills → runAgentLoop → postReview
+  - `mapVerdictToEvent()` — approve/request_changes/comment → GitHub review event
+  - `mapFindingsToComments()` — findings → ReviewComment[] with severity labels and skill attribution
+  - `formatReviewBody()` — markdown review body with skills list, finding counts by severity, stats
+- `src/agent/skills/types.ts` — `SandboxToolName` union, `SkillMetadata`, `Skill`, `SkillComposition` interfaces
+- `src/agent/skills/composer.ts` — `composeSkills(changedFiles, job)`:
+  - Selects skills based on file pattern matching (glob) against changed files
+  - Builds composed system prompt: preamble + skill instruction sections + `<review>` JSON output format
+  - Collects union of required tools from active skills
+  - `extractChangedFiles(diff)` — parses `+++ b/` lines from unified diff
+- `src/agent/skills/builtin/` — 5 built-in skills (all enabled by default):
+  - `security-review` (priority 10) — injection, auth bypass, secrets, path traversal, SSRF
+  - `bug-detection` (priority 20) — null errors, off-by-one, race conditions, resource leaks
+  - `architecture-review` (priority 30) — patterns, coupling, API design
+  - `code-quality` (priority 40) — readability, complexity, naming, dead code
+  - `data-flow-analysis` (priority 50) — data flow tracing, taint analysis
+- `src/index.ts` — queue handler: `validateReviewJob()` → `executeReview(job, env)` with ack/retry; malformed messages discarded (acked, not retried)
 
-**Verify:** Deploy, open PR on test repo, review appears on PR within 30-60s.
+**Verified:** `npx tsc --noEmit` ✅.
 
 ### Phase 6: Data Layer (D1)
 - `src/db/schema.ts` — migration SQL:
@@ -255,6 +298,10 @@ npx wrangler secret put ANTHROPIC_API_KEY
 
 # Session signing
 npx wrangler secret put SESSION_SECRET
+
+# AI Gateway (optional — if not set, Anthropic API called directly)
+npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
+npx wrangler secret put AI_GATEWAY_ID
 ```
 
 Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Gateway `code-refinery`, Pages `code-refinery-dashboard`.
@@ -279,6 +326,24 @@ Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Ga
 - Private keys stored as Cloudflare secrets, passed to sandbox only as short-lived installation tokens
 - Agent loop capped at 20 iterations with structured `<review>` JSON output
 - D1 tracks every agent turn for observability (review_traces table)
+
+### Sandbox Conventions
+- Sandbox SDK exports `ExecuteResponse` (not `ExecResult`) as the return type for `sandbox.exec()`
+- `getSandbox()` from SDK takes a string ID — we wrap it with `getSandboxForRepo()` using `owner--repo` format
+- Repo cloned to `/workspace/repo` constant (`REPO_DIR`), not workspace root
+- Token injected into clone URL via `URL` constructor: `x-access-token:{token}@github.com`
+- Path validation: `normalizePath()` resolves `..`/`.`, then checks prefix is `/workspace/repo/`
+- Command allowlist is prefix-based: `git log --oneline -10` matches `git log` (exact OR prefix + space)
+- `runCommand()` does NOT throw on non-zero exit — agent loop needs to see test failure output
+- `runCommand()` rejects shell metacharacters (`; | & \` $ ( )` etc.) before allowlist check — prevents prompt injection chaining
+- `setupRepo()` DOES throw on failure — clone/fetch errors are hard failures
+- `setupRepo()` strips token from remote URL after clone/fetch — prevents user-controlled code (npm test etc.) from reading it via `git remote get-url origin`
+- `setupRepo()` handles fork PRs: tries branch fetch first, falls back to SHA fetch if branch not on remote
+- `shellQuote()` wraps values in single quotes with interior `'` escaped — used for URLs, patterns
+- `scrubTokens()` redacts credentials from URLs in error messages/logs
+- `searchContent()` wraps ripgrep (`rg`) with input validation, returns empty string for no matches (rg exit 1 = no matches, not an error)
+- `findFiles()` wraps `find` with pattern validation and max depth limit (default 10, max 15)
+- rg and find are NOT in `COMMAND_ALLOWLIST` — only accessible via `searchContent()`/`findFiles()` which validate inputs. Raw rg/find via `runCommand` would expose dangerous flags like `--pre`
 
 ### Wrangler / Cloudflare Conventions
 - `[[containers]]` uses double-bracket (array) TOML syntax, not `[containers]`
