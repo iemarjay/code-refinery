@@ -47,17 +47,21 @@ PR review agent built on Cloudflare Workers, Sandbox SDK, Queues, AI Gateway, an
 
 ```
 GitHub Webhook (PR opened/synchronized)
-  → fetch() handler: verify HMAC-SHA256 signature, enqueue ReviewJob
+  → fetch() handler: verify HMAC-SHA256 signature
+  → tryEnqueueJob() — SHA dedup, repo rate limit (50/hr), PR debounce (supersede older jobs)
+  → env.REVIEW_QUEUE.send(job)
   → Cloudflare Queue (pr-review-jobs, batch_size=1, max_retries=3)
-  → queue() handler: validateReviewJob() → executeReview(job, env):
-      1. getInstallationToken() — JWT + exchange
-      2. getSandboxForRepo(env.SANDBOX, "owner/repo") — keyed by owner--repo for warm clones
-      3. setupRepo(sandbox, cloneUrl, headRef, headSha, token) — clone (--depth=50) or fetch+checkout+reset
-      4. getPRDiff() — GitHub API with Accept: application/vnd.github.diff
-      5. composeSkills(changedFiles, job) — select skills, build system prompt, collect tools
-      6. runAgentLoop() — while(has_tool_calls) Anthropic API ↔ sandbox.exec() / sandbox.readFile()
-      7. postReview() — GitHub PR review API
-      8. message.ack()
+  → queue() handler: validateReviewJob() → isJobSuperseded() check → executeReview(job, env):
+      1. upsertInstallation() + upsertRepo() — resolve DB IDs early (for failure recording)
+      2. getInstallationToken() — JWT + exchange
+      3. getSandboxForRepo(env.SANDBOX, "owner/repo") — keyed by owner--repo for warm clones
+      4. setupRepo(sandbox, cloneUrl, headRef, headSha, token) — clone (--depth=50) or fetch+checkout+reset
+      5. getPRDiff() — GitHub API with Accept: application/vnd.github.diff
+      6. composeSkills(changedFiles, job) — select skills, build system prompt, collect tools
+      7. runAgentLoop() — while(has_tool_calls) Anthropic API ↔ sandbox.exec() / sandbox.readFile()
+      8. persistReview() — D1: reviews row + review_traces batch (or failed review on error)
+      9. postReview() — GitHub PR review API
+     10. markJobDone() + message.ack()
 ```
 
 ### Key Design Decisions
@@ -81,6 +85,12 @@ GitHub Webhook (PR opened/synchronized)
 | Sandbox image | `cloudflare/sandbox:0.1.4` + ripgrep | Official sandbox base image with built-in server; ripgrep for `searchContent()` |
 | gh CLI | Not used | All GitHub API via fetch() in Worker. Smaller container image |
 | Cloudflare agents-sdk | Not used | Designed for client-facing chat agents. We're webhook-driven, backend-only |
+| DB write isolation | try-catch, non-blocking | DB failures must not prevent review from posting to GitHub |
+| Upsert pattern | SELECT-then-INSERT with retry on UNIQUE conflict | D1 lacks reliable `INSERT ... ON CONFLICT ... RETURNING`. Retry-on-conflict handles races |
+| Error scrubbing | `scrubErrorMessage()` before DB storage | Prevents tokens/keys from leaking into D1 `error_message` column |
+| Token accounting | Split `input_tokens` + `output_tokens` | Different pricing per direction; needed for accurate billing |
+| Job dedup | `job_dedup` table with SHA+PR UNIQUE constraint | Prevents duplicate reviews on rapid pushes; enables PR debounce and rate limiting |
+| Schema duplication | `schema.ts` (source of truth) + `migrations/*.sql` (deploy artifact) | Manual sync required — no build step. Convention: always update both |
 
 ### Warm Sandbox Strategy
 
@@ -92,14 +102,14 @@ Sandboxes keyed by **repo** (not PR), using `owner--repo` as DO ID. Durable Obje
 
 ```
 src/                                 ── Worker (webhook + API + queue consumer)
-  index.ts                           — Entry point, route dispatch, Env type, re-exports Sandbox
-  router.ts                          — Webhook signature verification + event routing
+  index.ts                           — Entry point, route dispatch, Env type, re-exports Sandbox, queue consumer with dedup
+  router.ts                          — Webhook signature verification + event routing + tryEnqueueJob() gate
   github/
     auth.ts                          — JWT generation (RS256 via Web Crypto), installation token exchange
     api.ts                           — PR diff, post review, post comment
     types.ts                         — Webhook payload + ReviewJob types
   agent/
-    review.ts                        — executeReview() orchestrator (auth → sandbox → diff → skills → loop → post)
+    review.ts                        — executeReview() orchestrator (auth → sandbox → diff → skills → loop → persist → post), failure recording, error scrubbing
     loop.ts                          — Agentic while-loop (core brain), ReviewResult/ReviewFinding/AgentTrace types
     tools.ts                         — Tool definitions for Anthropic API + routeToolCall() dispatcher
     skills/
@@ -121,8 +131,11 @@ src/                                 ── Worker (webhook + API + queue consum
     usage.ts                         — GET /api/usage (metrics, token counts)
     middleware.ts                    — Session auth middleware
   db/
-    schema.ts                        — D1 table definitions (migrations)
-    queries.ts                       — Typed query helpers
+    schema.ts                        — D1 table DDL (SCHEMA_V1): users, installations, repos, reviews, review_traces, sessions, job_dedup
+    queries.ts                       — Typed query helpers: upserts, insertReview, insertReviewTraces (batch), job dedup/rate-limit, dashboard reads
+migrations/
+  0001_initial_schema.sql            — D1 migration: all tables (users, installations, repos, reviews, review_traces, sessions, job_dedup)
+  0002_job_dedup.sql                 — D1 migration: job_dedup table + indexes (idempotent — safe if already in 0001)
 Dockerfile                           — Sandbox image: cloudflare/sandbox + ripgrep (no server)
 dashboard/                           ── React SPA (Cloudflare Pages)
   src/
@@ -241,18 +254,27 @@ Create all config files and stubs so `npm install && npx wrangler dev` works.
 
 **Verified:** `npx tsc --noEmit` ✅.
 
-### Phase 6: Data Layer (D1)
-- `src/db/schema.ts` — migration SQL:
-  - users (id, github_id, github_login, avatar_url, created_at)
-  - installations (id, github_installation_id, user_id, status)
-  - repos (id, installation_id, full_name, enabled, settings_json, created_at)
-  - reviews (id, repo_id, pr_number, pr_title, head_sha, verdict, summary, comments_json, tokens_used, duration_ms, created_at)
-  - review_traces (id, review_id, turn_number, role, content_json, tool_name, tokens_used)
-  - sessions (id, user_id, token_hash, expires_at)
-- `src/db/queries.ts` — typed helpers
-- Integrate with agent loop: log each turn to review_traces, write reviews row on completion
+### Phase 6: Data Layer (D1) ✅
+- `src/db/schema.ts` — SCHEMA_V1 with 7 tables:
+  - users (github_id, github_login, avatar_url) — Phase 7 OAuth
+  - installations (github_installation_id, status) — auto-upserted on first webhook
+  - repos (installation_id, full_name, enabled, settings_json) — auto-upserted on first webhook
+  - reviews (repo_id, pr_number, pr_title, pr_body, pr_author, head_sha, head_ref, base_sha, base_ref, status, error_message, verdict, summary, findings_json, model, input_tokens, output_tokens, duration_ms, setup_duration_ms, sandbox_warm, files_changed, lines_added, lines_removed, active_skills_json) — completed and failed reviews
+  - review_traces (review_id, turn_number, role, content_json, tool_name, tokens_used)
+  - sessions (user_id, token_hash, expires_at) — Phase 7 OAuth
+  - job_dedup (repo_full_name, pr_number, head_sha, status) — SHA dedup, rate limiting, PR debounce
+- `src/db/queries.ts`:
+  - Write: `upsertInstallation()`, `upsertRepo()` (SELECT-then-INSERT with UNIQUE conflict retry), `insertReview()` (24-column INSERT), `insertReviewTraces()` (`db.batch()`)
+  - Dedup: `tryEnqueueJob()` (3-layer gate: repo enabled → SHA dedup → rate limit + PR debounce), `isJobSuperseded()`, `markJobProcessing()`, `markJobDone()`
+  - Read (Phase 7): `getReviewsByRepo()`, `getReviewById()`, `getReviewTraces()`, `getRepoByFullName()`, `getRepoSettings()`
+- `migrations/0001_initial_schema.sql` — copy of SCHEMA_V1 for `wrangler d1 migrations apply`
+- `src/agent/review.ts` — restructured `executeReview()`: upserts repo/installation early, wraps main flow in try-catch, records failures to D1 with `scrubErrorMessage()`, collects diff stats + sandbox perf + active skills
+- `src/router.ts` — gates webhooks through `tryEnqueueJob()` before enqueuing
+- `src/index.ts` — queue consumer checks `isJobSuperseded()`, calls `markJobProcessing()`/`markJobDone()`
+- `src/github/types.ts` — added `prAuthor` to ReviewJob
+- `src/agent/loop.ts` — exported `MODEL` constant
 
-**Verify:** `npx wrangler d1 execute code-refinery-db --command "SELECT * FROM reviews"`
+**Verified:** `npx tsc --noEmit` ✅.
 
 ### Phase 7: Dashboard API + GitHub OAuth
 - `src/api/auth.ts` — GitHub OAuth: /auth/login → /auth/callback → /auth/logout
@@ -344,6 +366,19 @@ Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Ga
 - `searchContent()` wraps ripgrep (`rg`) with input validation, returns empty string for no matches (rg exit 1 = no matches, not an error)
 - `findFiles()` wraps `find` with pattern validation and max depth limit (default 10, max 15)
 - rg and find are NOT in `COMMAND_ALLOWLIST` — only accessible via `searchContent()`/`findFiles()` which validate inputs. Raw rg/find via `runCommand` would expose dangerous flags like `--pre`
+
+### D1 / Database Conventions
+- All queries use parameterized prepared statements (`.bind()`) — never string interpolation in SQL
+- `schema.ts` is source of truth for DDL; `migrations/0001_initial_schema.sql` is the deploy artifact — always update both when changing schema
+- Upsert pattern: SELECT-then-INSERT with catch-retry on UNIQUE constraint — handles concurrent request races
+- `insertReviewTraces()` uses `db.batch()` for single round-trip (up to ~40 statements per review)
+- DB write failures in `executeReview()` are caught and logged — never block the GitHub review from posting
+- `scrubErrorMessage()` redacts GitHub tokens (`ghs_`/`ghp_`/`gho_`/`github_pat_`), Anthropic keys (`sk-ant-`), Bearer tokens, and URL-embedded credentials before storing in `error_message` column
+- `reviews.status` is either `completed` or `failed` — failed reviews have `error_message` populated, nullable `verdict`/`summary`/`findings_json`
+- `reviews.input_tokens` and `output_tokens` stored separately (different pricing per direction)
+- `job_dedup` table gates webhook processing: SHA dedup (UNIQUE constraint), per-repo rate limit (50/hr), PR debounce (supersede older pending jobs for same PR)
+- `job_dedup.status` lifecycle: `queued` → `processing` → `done`/`failed`/`superseded`
+- Queue consumer checks `isJobSuperseded()` before starting expensive agent loop work
 
 ### Wrangler / Cloudflare Conventions
 - `[[containers]]` uses double-bracket (array) TOML syntax, not `[containers]`

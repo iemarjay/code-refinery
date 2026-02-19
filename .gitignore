@@ -4,7 +4,5 @@ node_modules/
 *.pem
 .wrangler/
 dist/
-container/node_modules/
-container/dist/
 dashboard/node_modules/
 dashboard/dist/

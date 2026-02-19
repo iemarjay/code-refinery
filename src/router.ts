@@ -1,5 +1,6 @@
 import type { Env } from "./index";
 import type { PullRequestEvent, ReviewJob } from "./github/types";
+import { tryEnqueueJob } from "./db/queries";
 
 const RELEVANT_ACTIONS = new Set(["opened", "synchronize"]);
 
@@ -86,16 +87,31 @@ export async function handleWebhook(
     return new Response("Missing installation ID", { status: 400 });
   }
 
+  const repoFullName = payload.repository.full_name;
+  const prNumber = payload.pull_request.number;
+  const headSha = payload.pull_request.head.sha;
+
+  // Rate limit, SHA dedup, and PR debounce — all in one D1 call
+  const dedup = await tryEnqueueJob(env.DB, repoFullName, prNumber, headSha);
+  if (!dedup.allowed) {
+    const status = dedup.reason === "rate_limited" ? 429 : 200;
+    return new Response(
+      JSON.stringify({ message: `Skipped: ${dedup.reason}`, prNumber }),
+      { status, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
   const job: ReviewJob = {
-    prNumber: payload.pull_request.number,
+    prNumber,
     prTitle: payload.pull_request.title,
     prBody: payload.pull_request.body,
-    repoFullName: payload.repository.full_name,
+    repoFullName,
     cloneUrl: payload.repository.clone_url,
     headRef: payload.pull_request.head.ref,
-    headSha: payload.pull_request.head.sha,
+    headSha,
     baseRef: payload.pull_request.base.ref,
     baseSha: payload.pull_request.base.sha,
+    prAuthor: payload.pull_request.user.login,
     installationId: payload.installation.id,
     enqueuedAt: new Date().toISOString(),
   };

@@ -1,6 +1,7 @@
 import { handleWebhook } from "./router";
 import { executeReview } from "./agent/review";
 import type { ReviewJob } from "./github/types";
+import { isJobSuperseded, markJobProcessing, markJobDone } from "./db/queries";
 
 import type { Sandbox } from "@cloudflare/sandbox";
 export { Sandbox } from "@cloudflare/sandbox";
@@ -64,6 +65,7 @@ function validateReviewJob(raw: unknown): ReviewJob {
     headSha: obj.headSha,
     baseRef: obj.baseRef,
     baseSha: obj.baseSha,
+    prAuthor: typeof obj.prAuthor === "string" ? obj.prAuthor : "",
     installationId: obj.installationId,
     enqueuedAt: typeof obj.enqueuedAt === "string" ? obj.enqueuedAt : new Date().toISOString(),
   };
@@ -100,10 +102,22 @@ export default {
         msg.ack(); // discard malformed messages — retrying won't fix them
         continue;
       }
+
+      // Debounce: skip if a newer push superseded this job
+      if (await isJobSuperseded(env.DB, job.repoFullName, job.prNumber, job.headSha)) {
+        console.log(`Skipping superseded job: ${job.repoFullName} PR #${job.prNumber} ${job.headSha.slice(0, 7)}`);
+        msg.ack();
+        continue;
+      }
+
+      await markJobProcessing(env.DB, job.repoFullName, job.prNumber, job.headSha);
+
       try {
         await executeReview(job, env);
+        await markJobDone(env.DB, job.repoFullName, job.prNumber, job.headSha, "done");
         msg.ack();
       } catch (err) {
+        await markJobDone(env.DB, job.repoFullName, job.prNumber, job.headSha, "failed");
         console.error(`Job failed for ${job.repoFullName} PR #${job.prNumber}:`, err);
         msg.retry();
       }

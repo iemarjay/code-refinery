@@ -19,6 +19,7 @@ dead_letter_queue = "pr-review-jobs-dlq"
 binding = "DB"
 database_name = "code-refinery-db"
 database_id = "placeholder-will-be-replaced-after-d1-create"
+migrations_dir = "migrations"
 
 # Durable Objects — Sandbox
 [durable_objects]

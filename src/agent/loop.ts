@@ -6,7 +6,7 @@ import { routeToolCall } from "./tools";
 
 const MAX_ITERATIONS = 20;
 const MAX_TOKENS = 16_384;
-const MODEL = "claude-sonnet-4-5-20250929";
+export const MODEL = "claude-sonnet-4-5-20250929";
 
 export interface ReviewResult {
   verdict: "approve" | "request_changes" | "comment";

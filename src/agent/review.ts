@@ -1,89 +1,275 @@
-import type { Sandbox } from "@cloudflare/sandbox";
 import type { ReviewJob, ReviewComment } from "../github/types";
 import type { Env } from "../index";
 import { getInstallationToken } from "../github/auth";
 import { getPRDiff, postReview } from "../github/api";
 import { getSandboxForRepo, setupRepo } from "../sandbox/helpers";
 import { composeSkills, extractChangedFiles } from "./skills/composer";
-import { runAgentLoop } from "./loop";
-import type { ReviewResult, ReviewFinding } from "./loop";
+import { runAgentLoop, MODEL } from "./loop";
+import type { ReviewResult, ReviewFinding, AgentTrace } from "./loop";
+import {
+  upsertInstallation,
+  upsertRepo,
+  insertReview,
+  insertReviewTraces,
+} from "../db/queries";
 
 export async function executeReview(
   job: ReviewJob,
   env: Env,
 ): Promise<void> {
-  // 1. Auth
-  const token = await getInstallationToken(
-    env.GITHUB_APP_ID,
-    env.GITHUB_PRIVATE_KEY,
-    job.installationId,
-  );
+  const startTime = Date.now();
+  let repoId: number | undefined;
+  let setupDurationMs: number | undefined;
+  let sandboxWarm: boolean | undefined;
 
-  // 2. Sandbox setup
-  const sandbox = getSandboxForRepo(env.SANDBOX, job.repoFullName);
-  const setupResult = await setupRepo(sandbox, job.cloneUrl, job.headRef, job.headSha, token);
-  console.log(
-    `Repo setup: repo=${job.repoFullName} cloned=${setupResult.cloned} ` +
-      `duration=${setupResult.duration}ms`,
-  );
+  // Resolve repo in DB early so failures can be recorded
+  try {
+    const dbInstallationId = await upsertInstallation(env.DB, job.installationId);
+    repoId = await upsertRepo(env.DB, job.repoFullName, dbInstallationId);
+  } catch (dbErr) {
+    console.error(
+      `DB upsert failed for ${job.repoFullName} PR #${job.prNumber}:`,
+      dbErr,
+    );
+  }
 
-  // 3. Get PR diff
-  const [owner, repo] = job.repoFullName.split("/");
-  const diff = await getPRDiff(token, owner, repo, job.prNumber);
-  const changedFiles = extractChangedFiles(diff);
+  try {
+    // 1. Auth
+    const token = await getInstallationToken(
+      env.GITHUB_APP_ID,
+      env.GITHUB_PRIVATE_KEY,
+      job.installationId,
+    );
 
-  // 4. Compose skills
-  const composition = composeSkills(changedFiles, job);
-  console.log(
-    `Skills composed: active=[${composition.activeSkillNames.join(", ")}] ` +
-      `tools=${composition.tools.length} ` +
-      `skipped=${composition.skippedSkills.length}`,
-  );
+    // 2. Sandbox setup
+    const sandbox = getSandboxForRepo(env.SANDBOX, job.repoFullName);
+    const setupResult = await setupRepo(sandbox, job.cloneUrl, job.headRef, job.headSha, token);
+    setupDurationMs = setupResult.duration;
+    sandboxWarm = !setupResult.cloned;
+    console.log(
+      `Repo setup: repo=${job.repoFullName} cloned=${setupResult.cloned} ` +
+        `duration=${setupResult.duration}ms`,
+    );
 
-  // 5. Run agent loop
-  const gatewayBaseUrl =
-    env.CLOUDFLARE_ACCOUNT_ID && env.AI_GATEWAY_ID
-      ? `https://gateway.ai.cloudflare.com/v1/${env.CLOUDFLARE_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/anthropic`
-      : undefined;
+    // 3. Get PR diff
+    const [owner, repo] = job.repoFullName.split("/");
+    const diff = await getPRDiff(token, owner, repo, job.prNumber);
+    const changedFiles = extractChangedFiles(diff);
+    const diffStats = parseDiffStats(diff);
 
-  const { review, trace } = await runAgentLoop(
-    job,
-    diff,
-    sandbox,
-    composition,
-    env.ANTHROPIC_API_KEY,
-    gatewayBaseUrl,
-  );
+    // 4. Compose skills
+    const composition = composeSkills(changedFiles, job);
+    console.log(
+      `Skills composed: active=[${composition.activeSkillNames.join(", ")}] ` +
+        `tools=${composition.tools.length} ` +
+        `skipped=${composition.skippedSkills.length}`,
+    );
 
-  console.log(
-    `Agent loop complete: verdict=${review.verdict} ` +
-      `findings=${review.findings.length} ` +
-      `iterations=${trace.iterationCount} ` +
-      `tokens=${trace.totalInputTokens}+${trace.totalOutputTokens} ` +
-      `duration=${trace.durationMs}ms`,
-  );
+    // 5. Run agent loop
+    const gatewayBaseUrl =
+      env.CLOUDFLARE_ACCOUNT_ID && env.AI_GATEWAY_ID
+        ? `https://gateway.ai.cloudflare.com/v1/${env.CLOUDFLARE_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/anthropic`
+        : undefined;
 
-  // 6. Post review to GitHub
-  const event = mapVerdictToEvent(review.verdict);
-  const comments = mapFindingsToComments(review.findings);
-  const body = formatReviewBody(review, composition, trace);
+    const { review, trace } = await runAgentLoop(
+      job,
+      diff,
+      sandbox,
+      composition,
+      env.ANTHROPIC_API_KEY,
+      gatewayBaseUrl,
+    );
 
-  await postReview(
-    token,
-    owner,
-    repo,
-    job.prNumber,
-    body,
-    comments,
-    event,
-    job.headSha,
-  );
+    console.log(
+      `Agent loop complete: verdict=${review.verdict} ` +
+        `findings=${review.findings.length} ` +
+        `iterations=${trace.iterationCount} ` +
+        `tokens=${trace.totalInputTokens}+${trace.totalOutputTokens} ` +
+        `duration=${trace.durationMs}ms`,
+    );
 
-  console.log(
-    `Review posted: PR #${job.prNumber} ${event} with ${comments.length} inline comments ` +
-      `total_duration=${Date.now()}ms`,
+    // 6. Persist to D1
+    await persistReview(env.DB, repoId, job, {
+      status: "completed",
+      review,
+      trace,
+      setupDurationMs,
+      sandboxWarm,
+      diffStats,
+      activeSkillNames: [...composition.activeSkillNames],
+    });
+
+    // 7. Post review to GitHub
+    const event = mapVerdictToEvent(review.verdict);
+    const comments = mapFindingsToComments(review.findings);
+    const body = formatReviewBody(review, composition, trace);
+
+    await postReview(
+      token,
+      owner,
+      repo,
+      job.prNumber,
+      body,
+      comments,
+      event,
+      job.headSha,
+    );
+
+    console.log(
+      `Review posted: PR #${job.prNumber} ${event} with ${comments.length} inline comments ` +
+        `total_duration=${Date.now() - startTime}ms`,
+    );
+  } catch (err) {
+    // Record failure in DB — scrub secrets before storing
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    await persistReview(env.DB, repoId, job, {
+      status: "failed",
+      errorMessage: scrubErrorMessage(rawMessage),
+      durationMs: Date.now() - startTime,
+      setupDurationMs,
+      sandboxWarm,
+    });
+
+    // Re-throw so the queue handler can retry
+    throw err;
+  }
+}
+
+// --- Error scrubbing ---
+
+/** Redact credentials from error messages before storing in DB. */
+function scrubErrorMessage(message: string): string {
+  return (
+    message
+      // URLs with embedded credentials: https://x-access-token:ghs_xxx@github.com
+      .replace(/https?:\/\/[^@\s]*@/g, (match) =>
+        match.replace(/\/\/.*@/, "//<REDACTED>@"),
+      )
+      // GitHub tokens: ghs_xxx, ghp_xxx, gho_xxx, github_pat_xxx
+      .replace(/\b(ghs|ghp|gho|github_pat)_[A-Za-z0-9_]+/g, "$1_<REDACTED>")
+      // Anthropic API keys: sk-ant-xxx
+      .replace(/\bsk-ant-[A-Za-z0-9_-]+/g, "sk-ant-<REDACTED>")
+      // Generic bearer tokens in headers
+      .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, "Bearer <REDACTED>")
   );
 }
+
+// --- DB persistence ---
+
+interface PersistCompletedParams {
+  status: "completed";
+  review: ReviewResult;
+  trace: AgentTrace;
+  setupDurationMs?: number;
+  sandboxWarm?: boolean;
+  diffStats?: DiffStats;
+  activeSkillNames?: string[];
+}
+
+interface PersistFailedParams {
+  status: "failed";
+  errorMessage: string;
+  durationMs: number;
+  setupDurationMs?: number;
+  sandboxWarm?: boolean;
+}
+
+async function persistReview(
+  db: D1Database,
+  repoId: number | undefined,
+  job: ReviewJob,
+  params: PersistCompletedParams | PersistFailedParams,
+): Promise<void> {
+  if (repoId == null) return; // DB upsert failed earlier, nothing to write to
+
+  try {
+    if (params.status === "completed") {
+      const reviewId = await insertReview(db, {
+        repoId,
+        prNumber: job.prNumber,
+        prTitle: job.prTitle,
+        prBody: job.prBody,
+        prAuthor: job.prAuthor,
+        headSha: job.headSha,
+        headRef: job.headRef,
+        baseSha: job.baseSha,
+        baseRef: job.baseRef,
+        status: "completed",
+        verdict: params.review.verdict,
+        summary: params.review.summary,
+        findingsJson: JSON.stringify(params.review.findings),
+        model: MODEL,
+        inputTokens: params.trace.totalInputTokens,
+        outputTokens: params.trace.totalOutputTokens,
+        durationMs: params.trace.durationMs,
+        setupDurationMs: params.setupDurationMs,
+        sandboxWarm: params.sandboxWarm,
+        filesChanged: params.diffStats?.filesChanged,
+        linesAdded: params.diffStats?.linesAdded,
+        linesRemoved: params.diffStats?.linesRemoved,
+        activeSkillsJson: params.activeSkillNames
+          ? JSON.stringify(params.activeSkillNames)
+          : undefined,
+      });
+      await insertReviewTraces(db, reviewId, params.trace.turns);
+      console.log(`DB write: review_id=${reviewId} traces=${params.trace.turns.length}`);
+    } else {
+      await insertReview(db, {
+        repoId,
+        prNumber: job.prNumber,
+        prTitle: job.prTitle,
+        prBody: job.prBody,
+        prAuthor: job.prAuthor,
+        headSha: job.headSha,
+        headRef: job.headRef,
+        baseSha: job.baseSha,
+        baseRef: job.baseRef,
+        status: "failed",
+        errorMessage: params.errorMessage,
+        model: MODEL,
+        inputTokens: 0,
+        outputTokens: 0,
+        durationMs: params.durationMs,
+        setupDurationMs: params.setupDurationMs,
+        sandboxWarm: params.sandboxWarm,
+      });
+      console.log(`DB write: recorded failed review for PR #${job.prNumber}`);
+    }
+  } catch (dbErr) {
+    console.error(
+      `DB write failed for ${job.repoFullName} PR #${job.prNumber}:`,
+      dbErr,
+    );
+  }
+}
+
+// --- Diff stats ---
+
+interface DiffStats {
+  filesChanged: number;
+  linesAdded: number;
+  linesRemoved: number;
+}
+
+function parseDiffStats(diff: string): DiffStats {
+  let filesChanged = 0;
+  let linesAdded = 0;
+  let linesRemoved = 0;
+
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++ b/")) {
+      filesChanged++;
+    } else if (line.startsWith("+") && !line.startsWith("+++")) {
+      linesAdded++;
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      linesRemoved++;
+    }
+  }
+
+  return { filesChanged, linesAdded, linesRemoved };
+}
+
+// --- GitHub helpers ---
 
 function mapVerdictToEvent(
   verdict: ReviewResult["verdict"],

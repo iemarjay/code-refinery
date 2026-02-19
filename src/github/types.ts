@@ -51,6 +51,7 @@ export interface ReviewJob {
   headSha: string;
   baseRef: string;
   baseSha: string;
+  prAuthor: string;
   installationId: number;
   enqueuedAt: string;
 }
