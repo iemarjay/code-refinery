@@ -6,7 +6,8 @@ export type SandboxToolName =
   | "run_command"
   | "git_diff"
   | "search_content"
-  | "find_files";
+  | "find_files"
+  | "check_vulnerabilities";
 
 export interface SkillMetadata {
   readonly name: string;

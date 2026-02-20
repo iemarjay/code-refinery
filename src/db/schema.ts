@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS reviews (
   lines_added INTEGER,
   lines_removed INTEGER,
   active_skills_json TEXT,
+  diff_text TEXT,
+  system_prompt_hash TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
 );
@@ -74,7 +76,12 @@ CREATE TABLE IF NOT EXISTS review_traces (
   role TEXT NOT NULL,
   content_json TEXT NOT NULL,
   tool_name TEXT,
+  tool_input TEXT,
+  tool_result TEXT,
   tokens_used INTEGER,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  iteration INTEGER,
   FOREIGN KEY (review_id) REFERENCES reviews(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_traces_review ON review_traces(review_id, turn_number);
@@ -104,4 +111,12 @@ CREATE TABLE IF NOT EXISTS job_dedup (
 CREATE INDEX IF NOT EXISTS idx_dedup_repo_created ON job_dedup(repo_full_name, created_at);
 CREATE INDEX IF NOT EXISTS idx_dedup_pr_status ON job_dedup(repo_full_name, pr_number, status);
 CREATE INDEX IF NOT EXISTS idx_dedup_lookup ON job_dedup(repo_full_name, head_sha, status);
+
+-- user_installations: M:N join table for users <-> installations
+CREATE TABLE IF NOT EXISTS user_installations (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  installation_id INTEGER NOT NULL REFERENCES installations(id) ON DELETE CASCADE,
+  linked_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, installation_id)
+);
 `;

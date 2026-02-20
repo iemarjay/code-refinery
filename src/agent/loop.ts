@@ -4,9 +4,15 @@ import type { ReviewJob } from "../github/types";
 import type { SkillComposition } from "./skills/types";
 import { routeToolCall } from "./tools";
 
-const MAX_ITERATIONS = 20;
 const MAX_TOKENS = 16_384;
 export const MODEL = "claude-sonnet-4-5-20250929";
+
+/** Scale iteration budget based on the number of changed files. */
+function getMaxIterations(changedFileCount: number): number {
+  if (changedFileCount <= 5) return 10;
+  if (changedFileCount <= 15) return 15;
+  return 20;
+}
 
 export interface ReviewResult {
   verdict: "approve" | "request_changes" | "comment";
@@ -34,6 +40,7 @@ export interface AgentTrace {
 
 export interface AgentTurn {
   turnNumber: number;
+  iteration: number;
   role: "assistant" | "user";
   content: string;
   toolName?: string;
@@ -50,8 +57,10 @@ export async function runAgentLoop(
   composition: SkillComposition,
   apiKey: string,
   gatewayBaseUrl?: string,
+  changedFileCount?: number,
 ): Promise<{ review: ReviewResult; trace: AgentTrace }> {
   const startTime = Date.now();
+  const maxIterations = getMaxIterations(changedFileCount ?? 20);
 
   const client = new Anthropic({
     apiKey,
@@ -59,7 +68,7 @@ export async function runAgentLoop(
   });
 
   const messages: Anthropic.Messages.MessageParam[] = [
-    { role: "user", content: buildUserMessage(job, diff) },
+    { role: "user", content: buildUserMessage(job, diff, maxIterations) },
   ];
 
   const trace: AgentTrace = {
@@ -70,10 +79,14 @@ export async function runAgentLoop(
     durationMs: 0,
   };
 
+  const tag = `[agent ${job.repoFullName}#${job.prNumber}]`;
   let iteration = 0;
 
-  while (iteration < MAX_ITERATIONS) {
+  while (iteration < maxIterations) {
     iteration++;
+
+    console.log(`${tag} Iteration ${iteration}/${maxIterations}: calling Anthropic API...`);
+    const apiStart = Date.now();
 
     const response = await client.messages.create({
       model: MODEL,
@@ -84,11 +97,17 @@ export async function runAgentLoop(
       temperature: 0,
     });
 
+    console.log(
+      `${tag} Iteration ${iteration}: API responded in ${Date.now() - apiStart}ms ` +
+        `stop=${response.stop_reason} tokens=${response.usage.input_tokens}+${response.usage.output_tokens}`,
+    );
+
     trace.totalInputTokens += response.usage.input_tokens;
     trace.totalOutputTokens += response.usage.output_tokens;
 
     trace.turns.push({
       turnNumber: trace.turns.length + 1,
+      iteration,
       role: "assistant",
       content: serializeContentBlocks(response.content),
       inputTokens: response.usage.input_tokens,
@@ -98,6 +117,7 @@ export async function runAgentLoop(
     messages.push({ role: "assistant", content: response.content });
 
     if (response.stop_reason === "end_turn") {
+      console.log(`${tag} Iteration ${iteration}: end_turn — extracting review`);
       const review = extractReview(response.content);
       trace.iterationCount = iteration;
       trace.durationMs = Date.now() - startTime;
@@ -105,6 +125,7 @@ export async function runAgentLoop(
     }
 
     if (response.stop_reason === "max_tokens") {
+      console.warn(`${tag} Iteration ${iteration}: max_tokens hit — asking for summary`);
       messages.push({
         role: "user",
         content:
@@ -120,15 +141,35 @@ export async function runAgentLoop(
           block.type === "tool_use",
       );
 
+      console.log(
+        `${tag} Iteration ${iteration}: ${toolUseBlocks.length} tool call(s): ` +
+          toolUseBlocks.map((t) => t.name).join(", "),
+      );
+
+      // Execute all tool calls concurrently
+      for (const toolUse of toolUseBlocks) {
+        console.log(`${tag}   → ${toolUse.name}(${JSON.stringify(toolUse.input).slice(0, 200)})`);
+      }
+
+      const settled = await Promise.all(
+        toolUseBlocks.map(async (toolUse) => {
+          const toolStart = Date.now();
+          const { result, isError } = await routeToolCall(
+            sandbox,
+            toolUse.name,
+            toolUse.input,
+          );
+          console.log(
+            `${tag}   ← ${toolUse.name}: ${isError ? "ERROR" : "ok"} ` +
+              `${result.length} chars, ${Date.now() - toolStart}ms`,
+          );
+          return { toolUse, result, isError };
+        }),
+      );
+
       const toolResults: Anthropic.Messages.ToolResultBlockParam[] = [];
 
-      for (const toolUse of toolUseBlocks) {
-        const { result, isError } = await routeToolCall(
-          sandbox,
-          toolUse.name,
-          toolUse.input,
-        );
-
+      for (const { toolUse, result, isError } of settled) {
         toolResults.push({
           type: "tool_result",
           tool_use_id: toolUse.id,
@@ -138,11 +179,12 @@ export async function runAgentLoop(
 
         trace.turns.push({
           turnNumber: trace.turns.length + 1,
+          iteration,
           role: "user",
-          content: result.slice(0, 2000),
+          content: result.slice(0, 500),
           toolName: toolUse.name,
-          toolInput: JSON.stringify(toolUse.input).slice(0, 1000),
-          toolResult: result.slice(0, 2000),
+          toolInput: JSON.stringify(toolUse.input),
+          toolResult: result,
         });
       }
 
@@ -151,8 +193,11 @@ export async function runAgentLoop(
     }
 
     // Unexpected stop reason
+    console.warn(`${tag} Iteration ${iteration}: unexpected stop_reason="${response.stop_reason}"`);
     break;
   }
+
+  console.warn(`${tag} Reached max iterations (${iteration}), extracting from history`);
 
   // Hit max iterations — try to extract from conversation history
   trace.iterationCount = iteration;
@@ -190,14 +235,16 @@ export async function runAgentLoop(
   };
 }
 
-function buildUserMessage(job: ReviewJob, diff: string): string {
+function buildUserMessage(job: ReviewJob, diff: string, maxIterations: number): string {
   const cappedDiff =
     diff.length > 100_000
       ? diff.slice(0, 100_000) +
         "\n\n[DIFF TRUNCATED — use git_diff tool to see full diff]"
       : diff;
 
-  return `Please review the following PR diff. Use the available tools to examine files and run checks as needed.
+  return `Please review the following PR diff. Use the available tools to examine files as needed.
+
+**Iteration budget: ${maxIterations} turns.** Plan your exploration to complete within this budget. Prioritize reading the changed files and their immediate dependencies. Produce your review as soon as you have enough context — do not exhaust your budget unnecessarily.
 
 ## PR Diff
 

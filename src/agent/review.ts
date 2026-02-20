@@ -33,36 +33,41 @@ export async function executeReview(
     );
   }
 
+  const tag = `[review ${job.repoFullName}#${job.prNumber}]`;
+
   try {
     // 1. Auth
+    console.log(`${tag} Getting installation token for installation=${job.installationId}`);
     const token = await getInstallationToken(
       env.GITHUB_APP_ID,
       env.GITHUB_PRIVATE_KEY,
       job.installationId,
     );
+    console.log(`${tag} Token acquired`);
 
     // 2. Sandbox setup
     const sandbox = getSandboxForRepo(env.SANDBOX, job.repoFullName);
+    console.log(`${tag} Setting up sandbox: ref=${job.headRef} sha=${job.headSha.slice(0, 7)}`);
     const setupResult = await setupRepo(sandbox, job.cloneUrl, job.headRef, job.headSha, token);
     setupDurationMs = setupResult.duration;
     sandboxWarm = !setupResult.cloned;
     console.log(
-      `Repo setup: repo=${job.repoFullName} cloned=${setupResult.cloned} ` +
-        `duration=${setupResult.duration}ms`,
+      `${tag} Sandbox ready: cloned=${setupResult.cloned} duration=${setupResult.duration}ms`,
     );
 
     // 3. Get PR diff
     const [owner, repo] = job.repoFullName.split("/");
+    console.log(`${tag} Fetching PR diff`);
     const diff = await getPRDiff(token, owner, repo, job.prNumber);
+    console.log(`${tag} Diff fetched: ${diff.length} chars`);
     const changedFiles = extractChangedFiles(diff);
     const diffStats = parseDiffStats(diff);
 
     // 4. Compose skills
     const composition = composeSkills(changedFiles, job);
     console.log(
-      `Skills composed: active=[${composition.activeSkillNames.join(", ")}] ` +
-        `tools=${composition.tools.length} ` +
-        `skipped=${composition.skippedSkills.length}`,
+      `${tag} Skills: active=[${composition.activeSkillNames.join(", ")}] ` +
+        `tools=${composition.tools.length} skipped=${composition.skippedSkills.length}`,
     );
 
     // 5. Run agent loop
@@ -78,17 +83,18 @@ export async function executeReview(
       composition,
       env.ANTHROPIC_API_KEY,
       gatewayBaseUrl,
+      changedFiles.length,
     );
 
     console.log(
-      `Agent loop complete: verdict=${review.verdict} ` +
-        `findings=${review.findings.length} ` +
-        `iterations=${trace.iterationCount} ` +
+      `${tag} Agent loop complete: verdict=${review.verdict} ` +
+        `findings=${review.findings.length} iterations=${trace.iterationCount} ` +
         `tokens=${trace.totalInputTokens}+${trace.totalOutputTokens} ` +
         `duration=${trace.durationMs}ms`,
     );
 
     // 6. Persist to D1
+    const promptHash = await hashString(composition.systemPrompt);
     await persistReview(env.DB, repoId, job, {
       status: "completed",
       review,
@@ -97,6 +103,8 @@ export async function executeReview(
       sandboxWarm,
       diffStats,
       activeSkillNames: [...composition.activeSkillNames],
+      diff,
+      systemPromptHash: promptHash,
     });
 
     // 7. Post review to GitHub
@@ -116,7 +124,7 @@ export async function executeReview(
     );
 
     console.log(
-      `Review posted: PR #${job.prNumber} ${event} with ${comments.length} inline comments ` +
+      `${tag} Posted to GitHub: event=${event} comments=${comments.length} ` +
         `total_duration=${Date.now() - startTime}ms`,
     );
   } catch (err) {
@@ -154,6 +162,17 @@ function scrubErrorMessage(message: string): string {
   );
 }
 
+// --- Helpers ---
+
+async function hashString(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 16);
+}
+
 // --- DB persistence ---
 
 interface PersistCompletedParams {
@@ -164,6 +183,8 @@ interface PersistCompletedParams {
   sandboxWarm?: boolean;
   diffStats?: DiffStats;
   activeSkillNames?: string[];
+  diff?: string;
+  systemPromptHash?: string;
 }
 
 interface PersistFailedParams {
@@ -210,6 +231,8 @@ async function persistReview(
         activeSkillsJson: params.activeSkillNames
           ? JSON.stringify(params.activeSkillNames)
           : undefined,
+        diffText: params.diff,
+        systemPromptHash: params.systemPromptHash,
       });
       await insertReviewTraces(db, reviewId, params.trace.turns);
       console.log(`DB write: review_id=${reviewId} traces=${params.trace.turns.length}`);

@@ -47,8 +47,15 @@ export async function handleWebhook(
   request: Request,
   env: Env,
 ): Promise<Response> {
+  const deliveryId = request.headers.get("X-GitHub-Delivery") ?? "unknown";
+  const event = request.headers.get("X-GitHub-Event") ?? "unknown";
+  const logPrefix = `[webhook ${deliveryId}]`;
+
+  console.log(`${logPrefix} Received: event=${event}`);
+
   const signatureHeader = request.headers.get("X-Hub-Signature-256");
   if (!signatureHeader) {
+    console.warn(`${logPrefix} Rejected: missing signature`);
     return new Response("Missing signature", { status: 401 });
   }
 
@@ -60,11 +67,12 @@ export async function handleWebhook(
     body,
   );
   if (!isValid) {
+    console.warn(`${logPrefix} Rejected: invalid signature`);
     return new Response("Invalid signature", { status: 401 });
   }
 
-  const event = request.headers.get("X-GitHub-Event");
   if (event !== "pull_request") {
+    console.log(`${logPrefix} Ignored: event=${event} (not pull_request)`);
     return new Response("Ignored: not a pull_request event", { status: 200 });
   }
 
@@ -72,18 +80,29 @@ export async function handleWebhook(
   try {
     payload = JSON.parse(new TextDecoder().decode(body)) as PullRequestEvent;
   } catch {
+    console.error(`${logPrefix} Rejected: invalid JSON body`);
     return new Response("Invalid JSON", { status: 400 });
   }
 
+  const repo = payload.repository.full_name;
+  const pr = payload.pull_request.number;
+  const action = payload.action;
+  const sha = payload.pull_request.head.sha.slice(0, 7);
+
+  console.log(`${logPrefix} PR event: ${repo}#${pr} action=${action} sha=${sha} draft=${payload.pull_request.draft}`);
+
   if (!RELEVANT_ACTIONS.has(payload.action)) {
+    console.log(`${logPrefix} Ignored: action="${action}" not in [opened, synchronize]`);
     return new Response(`Ignored: action "${payload.action}"`, { status: 200 });
   }
 
   if (payload.pull_request.draft) {
+    console.log(`${logPrefix} Ignored: draft PR`);
     return new Response("Ignored: draft PR", { status: 200 });
   }
 
   if (!payload.installation?.id) {
+    console.warn(`${logPrefix} Rejected: missing installation ID`);
     return new Response("Missing installation ID", { status: 400 });
   }
 
@@ -94,6 +113,7 @@ export async function handleWebhook(
   // Rate limit, SHA dedup, and PR debounce — all in one D1 call
   const dedup = await tryEnqueueJob(env.DB, repoFullName, prNumber, headSha);
   if (!dedup.allowed) {
+    console.log(`${logPrefix} Skipped: ${dedup.reason} (${repo}#${pr} ${sha})`);
     const status = dedup.reason === "rate_limited" ? 429 : 200;
     return new Response(
       JSON.stringify({ message: `Skipped: ${dedup.reason}`, prNumber }),
@@ -117,6 +137,8 @@ export async function handleWebhook(
   };
 
   await env.REVIEW_QUEUE.send(job);
+
+  console.log(`${logPrefix} Enqueued: ${repo}#${pr} sha=${sha} author=${job.prAuthor}`);
 
   return new Response(
     JSON.stringify({ message: "Review queued", prNumber: job.prNumber }),

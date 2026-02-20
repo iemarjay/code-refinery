@@ -70,19 +70,27 @@ GitHub Webhook (PR opened/synchronized)
 |----------|--------|-----|
 | Worker count | 1 (fetch + queue + API) | Single deploy, shared types & D1 binding |
 | Dashboard | React SPA on Pages | Separate deploy cycle. Pages = free hosting + global CDN |
-| Auth | GitHub OAuth | Users are GitHub users. SSO, no password management |
+| Auth | GitHub OAuth (separate OAuth App) | Users are GitHub users. SSO, no password management. OAuth App is separate from the GitHub App used for webhooks |
+| User–repo mapping | M:N `user_installations` join table | Multiple org members can access the same installation's repos. Replaces singular `installations.user_id` |
+| CORS | `DASHBOARD_ORIGIN` env var, never wildcard | Pages and Worker are different origins. `SameSite=None; Secure; HttpOnly` cookies |
+| CSRF protection | Origin header check on mutations + cookie-based OAuth `state` | Origin check on POST/PATCH/PUT/DELETE. OAuth `state` cookie verified on callback |
+| Session tokens | 256-bit entropy, SHA-256 hash stored | Raw token never stored in DB. 30-day expiry. GitHub access token used once in callback, never stored |
 | Database | Cloudflare D1 | Native binding, zero-latency from Worker, SQL |
 | Sandbox | Cloudflare Sandbox SDK (`@cloudflare/sandbox`) | Built on Containers but no custom server needed — provides exec(), readFile(), writeFile() out of the box |
 | Agent loop | Manual while-loop | Full control over sandbox tool routing, timeouts, trace logging |
+| Iteration budget | Dynamic: 10 (≤5 files), 15 (≤15), 20 (>15) | Scales exploration budget with PR size |
 | Sandbox keying | Per repo (`owner--repo`) | Warm clones — 2nd+ review skips clone (~15s faster). 10m default sleep |
 | Clone strategy | `--depth=50` shallow clone | Fast first clone; enough history for most diffs. Agent falls back to GitHub API diff if baseSha not in history |
 | Repo directory | `/workspace/repo` (not root) | Keeps workspace clean, avoids conflicts with container WORKDIR |
-| Command execution | Allowlisted only (prefix-based) | Security — no arbitrary code from untrusted PRs. `runCommand` returns raw result (no throw on non-zero) so agent sees test failures |
+| Command execution | Static-analysis only allowlist (prefix-based) | Security — NO test runners (npm test, pytest, etc.) as they execute attacker-controlled code from untrusted PRs. Only audit commands, linters, and git |
+| Vuln scanning | OSV.dev API via `check_vulnerabilities` tool | Worker-side HTTP call to OSV batch API. Supports npm, PyPI, Go, crates.io, RubyGems, Maven. Max 50 packages per call |
+| Content search | `git grep` (not ripgrep) | Always available (no extra install), only searches tracked files, respects .gitignore via index |
+| Repo sync | `POST /api/repos/sync` via installation tokens | Fetches repos from GitHub API for each user installation, upserts into D1. Used by dashboard "Refresh repos" button |
 | Skills system | Composable skill modules | Each skill = metadata (file patterns, priority, required tools) + instructions. Composer selects skills by matching changed files, builds unified system prompt |
 | Model | claude-sonnet-4-5-20250929 | Balance of speed and quality for reviews |
 | Review output | `<review>` JSON tags | Reliable parsing with reasoning preamble |
 | Payments | Stubbed for later | Usage tracking in D1 from day 1 so billing data is ready |
-| Sandbox image | `cloudflare/sandbox:0.1.4` + ripgrep | Official sandbox base image with built-in server; ripgrep for `searchContent()` |
+| Sandbox image | `cloudflare/sandbox:0.1.4` | Official sandbox base image with built-in server |
 | gh CLI | Not used | All GitHub API via fetch() in Worker. Smaller container image |
 | Cloudflare agents-sdk | Not used | Designed for client-facing chat agents. We're webhook-driven, backend-only |
 | DB write isolation | try-catch, non-blocking | DB failures must not prevent review from posting to GitHub |
@@ -102,7 +110,7 @@ Sandboxes keyed by **repo** (not PR), using `owner--repo` as DO ID. Durable Obje
 
 ```
 src/                                 ── Worker (webhook + API + queue consumer)
-  index.ts                           — Entry point, route dispatch, Env type, re-exports Sandbox, queue consumer with dedup
+  index.ts                           — Entry point, route dispatch (matchRoute), Env type, re-exports Sandbox, queue consumer with dedup, validateReviewJob()
   router.ts                          — Webhook signature verification + event routing + tryEnqueueJob() gate
   github/
     auth.ts                          — JWT generation (RS256 via Web Crypto), installation token exchange
@@ -110,53 +118,64 @@ src/                                 ── Worker (webhook + API + queue consum
     types.ts                         — Webhook payload + ReviewJob types
   agent/
     review.ts                        — executeReview() orchestrator (auth → sandbox → diff → skills → loop → persist → post), failure recording, error scrubbing
-    loop.ts                          — Agentic while-loop (core brain), ReviewResult/ReviewFinding/AgentTrace types
-    tools.ts                         — Tool definitions for Anthropic API + routeToolCall() dispatcher
+    loop.ts                          — Agentic while-loop (core brain), dynamic iteration budget, ReviewResult/ReviewFinding/AgentTrace types
+    tools.ts                         — Tool definitions (7 tools incl. check_vulnerabilities) + routeToolCall() dispatcher
+    vuln.ts                          — OSV.dev vulnerability lookup: queryOSV() batch API, VulnEcosystem/VulnQuery/VulnResult types
     skills/
-      types.ts                       — SandboxToolName, SkillMetadata, Skill, SkillComposition interfaces
+      types.ts                       — SandboxToolName (7 tools), SkillMetadata, Skill, SkillComposition interfaces
       composer.ts                    — composeSkills(), buildSystemPrompt(), extractChangedFiles()
       builtin/
         index.ts                     — BUILTIN_SKILLS map (all 5 skills)
-        security-review.ts           — Injection, auth bypass, secrets, SSRF (priority 10)
+        security-review.ts           — Injection, auth bypass, secrets, SSRF, dependency vuln scanning (priority 10)
         bug-detection.ts             — Null errors, off-by-one, race conditions (priority 20)
         architecture-review.ts       — Patterns, coupling, API design (priority 30)
         code-quality.ts              — Readability, complexity, dead code (priority 40)
         data-flow-analysis.ts        — Data flow tracing, taint analysis (priority 50)
   sandbox/
-    helpers.ts                       — getSandboxForRepo(), setupRepo(), readFile(), runCommand(), listFiles(), gitDiff(), searchContent(), findFiles(), SandboxError
+    helpers.ts                       — getSandboxForRepo(), setupRepo(), readFile(), runCommand(cmd, cwd?), listFiles(), gitDiff(), searchContent(), findFiles(), SandboxError
   api/                               ── Dashboard REST API
-    auth.ts                          — GitHub OAuth flow (login, callback, session)
-    repos.ts                         — GET /api/repos, PATCH /api/repos/:id/settings
-    reviews.ts                       — GET /api/reviews, GET /api/reviews/:id/trace
-    usage.ts                         — GET /api/usage (metrics, token counts)
-    middleware.ts                    — Session auth middleware
+    cors.ts                          — handlePreflight(), withCors() — CORS with DASHBOARD_ORIGIN, never wildcard
+    middleware.ts                     — AuthContext, authenticate(), requireAuth(), checkCsrf(), cookie helpers, hashToken()
+    auth.ts                          — GitHub OAuth: handleAuthLogin(), handleAuthCallback(), handleAuthLogout(), handleAuthMe()
+    repos.ts                         — handleGetRepos(), handleSyncRepos(), handlePatchRepoSettings(), handleToggleRepo() + settings validation
+    reviews.ts                       — handleGetReviews(), handleGetReview(), handleGetReviewTrace() — all ownership-scoped
+    usage.ts                         — handleGetUsage() — aggregated stats, period capped at 365 days
   db/
-    schema.ts                        — D1 table DDL (SCHEMA_V1): users, installations, repos, reviews, review_traces, sessions, job_dedup
-    queries.ts                       — Typed query helpers: upserts, insertReview, insertReviewTraces (batch), job dedup/rate-limit, dashboard reads
+    schema.ts                        — D1 table DDL (SCHEMA_V1): users, installations, repos, reviews, review_traces, sessions, job_dedup, user_installations
+    queries.ts                       — Typed query helpers: upserts, insertReview, insertReviewTraces (batch), job dedup/rate-limit, dashboard reads (13 new query functions for API)
 migrations/
   0001_initial_schema.sql            — D1 migration: all tables (users, installations, repos, reviews, review_traces, sessions, job_dedup)
   0002_job_dedup.sql                 — D1 migration: job_dedup table + indexes (idempotent — safe if already in 0001)
-Dockerfile                           — Sandbox image: cloudflare/sandbox + ripgrep (no server)
+  0003_user_installations.sql        — D1 migration: M:N user_installations join table
+  0004_review_observability.sql      — D1 migration: extended review_traces columns (iteration, tool_input, tool_result), review diff_text + system_prompt_hash
+Dockerfile                           — Sandbox image: cloudflare/sandbox (no server)
 dashboard/                           ── React SPA (Cloudflare Pages)
   src/
-    App.tsx                          — Router + layout
+    main.tsx                         — ReactDOM root, QueryClientProvider, App
+    App.tsx                          — BrowserRouter, Routes, protected route wiring
     pages/
-      Login.tsx                      — GitHub OAuth login
-      Repos.tsx                      — Connected repos, enable/disable, settings
-      Reviews.tsx                    — Review history list
-      ReviewDetail.tsx               — Single review + full agent trace
-      Usage.tsx                      — Usage metrics, cost breakdown
-      Settings.tsx                   — Org settings, notification prefs
+      Login.tsx                      — GitHub OAuth login ("Sign in with GitHub" button)
+      Repos.tsx                      — Repo list with sync button, enable/disable toggles, settings, install URL
+      Reviews.tsx                    — Paginated review list with repo filter
+      ReviewDetail.tsx               — Review detail with findings by severity + TraceViewer
+      Usage.tsx                      — Period selector, summary cards, bar charts
+      Settings.tsx                   — Placeholder for future org settings
     components/
-      ReviewCard.tsx                 — Review summary card
-      TraceViewer.tsx                — Agent loop trace viewer (turns, tool calls)
-      RepoSettings.tsx               — Per-repo config editor
+      Layout.tsx                     — Sidebar nav + user avatar + logout
+      ProtectedRoute.tsx             — Redirect to /login if unauthenticated
+      ReviewCard.tsx                 — Review summary card with verdict badge
+      TraceViewer.tsx                — Expandable accordion of agent turns, tool calls, token counts
+      RepoSettings.tsx               — Modal: strictness radio, ignore patterns textarea, custom checklist
     lib/
-      api.ts                         — Typed fetch wrapper for /api/*
-      auth.ts                        — Auth context, token storage
-  package.json
+      types.ts                       — User, Repo, RepoSettings, Review, ReviewTrace, ReposResponse, SyncReposResponse, UsageStats, PaginatedReviews
+      api.ts                         — Typed apiFetch<T> with credentials: "include", methods for all endpoints incl. syncRepos()
+      auth.tsx                       — AuthProvider context, useAuth() hook, LOGIN_URL
+  package.json                       — react 19, react-router-dom 7, @tanstack/react-query 5, tailwindcss 3, vite 6
   tsconfig.json
-  vite.config.ts
+  vite.config.ts                     — Proxy /api and /auth to localhost:8787 in dev
+  tailwind.config.js
+  postcss.config.js
+  index.html
 wrangler.toml
 tsconfig.json
 package.json
@@ -207,31 +226,33 @@ Create all config files and stubs so `npm install && npx wrangler dev` works.
 **Verified:** `npx tsc --noEmit` ✅.
 
 ### Phase 4: Sandbox Setup ✅
-- `Dockerfile` (root) — base image `cloudflare/sandbox:0.1.4` + ripgrep; `EXPOSE 3000`; `/workspace` directory
+- `Dockerfile` (root) — base image `cloudflare/sandbox:0.1.4`; `EXPOSE 3000`; `/workspace` directory
 - `src/sandbox/helpers.ts`:
   - `SandboxError` — custom error class with command, exitCode, stderr for diagnostics
   - `getSandboxForRepo(ns, repoFullName)` — wraps `getSandbox()`, keys by `owner--repo` for warm clones
   - `setupRepo(sandbox, cloneUrl, headRef, headSha, token)` — warm path: update remote URL + fetch specific branch (falls back to SHA for fork PRs) + checkout + reset + clean; cold path: `git clone --depth=50`; token injected via URL constructor; **strips token from remote URL after setup** for security
   - `readFile(sandbox, path)` — `sandbox.readFile(path)` with path normalization and traversal validation (must be under `/workspace/repo/`)
-  - `runCommand(sandbox, cmd)` — shell metacharacter rejection + prefix-based allowlist check, does NOT throw on non-zero exit (agent loop needs failure output)
+  - `runCommand(sandbox, cmd, cwd?)` — shell metacharacter rejection + prefix-based allowlist check, optional `cwd` param for subdirectory execution, does NOT throw on non-zero exit (agent loop needs failure output)
   - `listFiles(sandbox, pattern?)` — `git ls-files` with shell metacharacter validation on pattern
   - `gitDiff(sandbox, baseSha)` — `git diff baseSha...HEAD` with SHA format validation
-  - `searchContent(sandbox, pattern, options?)` — wraps ripgrep (`rg`) with input validation; returns empty string for no matches (rg exit 1 = no matches)
+  - `searchContent(sandbox, pattern, options?)` — wraps `git grep` with input validation; returns empty string for no matches (exit 1 = no matches)
   - `findFiles(sandbox, pattern, options?)` — wraps `find` with pattern validation and max depth limit (default 10, max 15)
   - Internal helpers: `shellQuote()` for safe quoting, `scrubTokens()` to redact credentials from logs, `SAFE_GIT_REF_RE`/`SAFE_SHA_RE` for input validation
-  - Command allowlist (multi-language): JS/TS (npm test, npm run lint, npx tsc), Python (pytest, ruff, mypy), Go (go test, go vet), Rust (cargo test, cargo clippy), Ruby (bundle exec rake/rubocop), Java (gradlew, mvnw, mvn), generic (make test/lint), git commands. rg/find NOT in allowlist — only accessible via `searchContent()`/`findFiles()`
+  - Command allowlist (**static-analysis only** — NO test runners): vulnerability audits (npm audit, pip-audit, cargo audit, bundle audit, go list -m -json all), linters (ruff, mypy, go vet, cargo clippy, rubocop), git commands (log, show, ls-files, diff, branch, status). rg/find NOT in allowlist — only accessible via `searchContent()`/`findFiles()`
 - `src/index.ts` — `validateReviewJob()` runtime validation of queue messages; queue handler calls `executeReview(job, env)`; `Env.SANDBOX` typed as `DurableObjectNamespace<Sandbox>`; added `CLOUDFLARE_ACCOUNT_ID` and `AI_GATEWAY_ID` to Env
 
 **Verified:** `npx tsc --noEmit` ✅.
 
 ### Phase 5: Agent Loop (Core) ✅
-- `src/agent/tools.ts` — Tool definitions (read_file, list_files, run_command, git_diff, search_content, find_files) + `routeToolCall()` dispatcher with output capping (30k chars for commands/search, 50k for diffs)
-- `src/agent/loop.ts` — `runAgentLoop(job, diff, sandbox, composition, apiKey, gatewayBaseUrl?)`:
+- `src/agent/tools.ts` — Tool definitions (read_file, list_files, run_command, git_diff, search_content, find_files, check_vulnerabilities) + `routeToolCall()` dispatcher with output capping (30k chars for commands/search/vulns, 50k for diffs)
+- `src/agent/vuln.ts` — `queryOSV()` Worker-side vulnerability lookup via OSV.dev batch API. Supports npm, PyPI, Go, crates.io, RubyGems, Maven. Max 50 packages per call. Extracts severity from CVSS_V3 scores, fixed versions from affected ranges
+- `src/agent/loop.ts` — `runAgentLoop(job, diff, sandbox, composition, apiKey, gatewayBaseUrl?, changedFileCount?)`:
   - Anthropic client with optional AI Gateway baseURL
   - Model: `claude-sonnet-4-5-20250929`, max_tokens: 16384, temperature: 0
-  - While loop (max 20 iterations): messages.create → end_turn: extract `<review>` JSON → tool_use: route to sandbox → max_tokens: ask for summary
+  - Dynamic iteration budget: `getMaxIterations(changedFileCount)` → 10 (≤5 files), 15 (≤15 files), 20 (>15 files)
+  - While loop: messages.create → end_turn: extract `<review>` JSON → tool_use: route to sandbox → max_tokens: ask for summary
   - `ReviewResult` (verdict, summary, findings), `ReviewFinding` (skill, severity, path, line, title, body), `AgentTrace` (turns, tokens, duration)
-  - `buildUserMessage()` — formats PR diff (capped at 100k chars)
+  - `buildUserMessage()` — formats PR diff (capped at 100k chars), includes iteration budget in prompt
   - `parseReviewJson()` — extracts JSON from `<review>` tags, handles markdown code fences, validates verdict/findings
   - Fallback: on max iterations, walks backward through messages to find any `<review>` block
 - `src/agent/review.ts` — `executeReview(job, env)` orchestrates the full flow: auth → sandbox setup → getPRDiff → extractChangedFiles → composeSkills → runAgentLoop → postReview
@@ -255,18 +276,19 @@ Create all config files and stubs so `npm install && npx wrangler dev` works.
 **Verified:** `npx tsc --noEmit` ✅.
 
 ### Phase 6: Data Layer (D1) ✅
-- `src/db/schema.ts` — SCHEMA_V1 with 7 tables:
+- `src/db/schema.ts` — SCHEMA_V1 with 8 tables:
   - users (github_id, github_login, avatar_url) — Phase 7 OAuth
   - installations (github_installation_id, status) — auto-upserted on first webhook
   - repos (installation_id, full_name, enabled, settings_json) — auto-upserted on first webhook
   - reviews (repo_id, pr_number, pr_title, pr_body, pr_author, head_sha, head_ref, base_sha, base_ref, status, error_message, verdict, summary, findings_json, model, input_tokens, output_tokens, duration_ms, setup_duration_ms, sandbox_warm, files_changed, lines_added, lines_removed, active_skills_json) — completed and failed reviews
-  - review_traces (review_id, turn_number, role, content_json, tool_name, tokens_used)
+  - review_traces (review_id, turn_number, role, content_json, tool_name, tokens_used, iteration, tool_input, tool_result)
   - sessions (user_id, token_hash, expires_at) — Phase 7 OAuth
   - job_dedup (repo_full_name, pr_number, head_sha, status) — SHA dedup, rate limiting, PR debounce
+  - user_installations (user_id, installation_id) — M:N join table for multi-user org access
 - `src/db/queries.ts`:
   - Write: `upsertInstallation()`, `upsertRepo()` (SELECT-then-INSERT with UNIQUE conflict retry), `insertReview()` (24-column INSERT), `insertReviewTraces()` (`db.batch()`)
   - Dedup: `tryEnqueueJob()` (3-layer gate: repo enabled → SHA dedup → rate limit + PR debounce), `isJobSuperseded()`, `markJobProcessing()`, `markJobDone()`
-  - Read (Phase 7): `getReviewsByRepo()`, `getReviewById()`, `getReviewTraces()`, `getRepoByFullName()`, `getRepoSettings()`
+  - Dashboard reads: `upsertUser()`, `createSession()`, `getSessionWithUser()`, `deleteSession()`, `deleteExpiredSessions()`, `linkInstallationsToUser()`, `getReposForUser()`, `getInstallationIdsForUser()`, `getReviewsPaginated()`, `updateRepoSettings()`, `updateRepoEnabled()`, `verifyUserOwnsRepo()`, `verifyUserOwnsReview()`, `getUsageStats()`, `getReviewById()`, `getReviewTraces()`
 - `migrations/0001_initial_schema.sql` — copy of SCHEMA_V1 for `wrangler d1 migrations apply`
 - `src/agent/review.ts` — restructured `executeReview()`: upserts repo/installation early, wraps main flow in try-catch, records failures to D1 with `scrubErrorMessage()`, collects diff stats + sandbox perf + active skills
 - `src/router.ts` — gates webhooks through `tryEnqueueJob()` before enqueuing
@@ -276,23 +298,52 @@ Create all config files and stubs so `npm install && npx wrangler dev` works.
 
 **Verified:** `npx tsc --noEmit` ✅.
 
-### Phase 7: Dashboard API + GitHub OAuth
-- `src/api/auth.ts` — GitHub OAuth: /auth/login → /auth/callback → /auth/logout
-- `src/api/middleware.ts` — session cookie validation
-- `src/api/repos.ts` — GET /api/repos, PATCH /api/repos/:id/settings, POST enable/disable
-- `src/api/reviews.ts` — GET /api/reviews (paginated), GET /api/reviews/:id, GET /api/reviews/:id/trace
-- `src/api/usage.ts` — GET /api/usage?period=30d (aggregated stats)
-- `src/index.ts` — route dispatch: /api/* → handlers, /auth/* → OAuth
+### Phase 7: Dashboard API + GitHub OAuth ✅
+- `migrations/0003_user_installations.sql` — M:N join table for user–installation mapping (replaces singular `installations.user_id`)
+- `migrations/0004_review_observability.sql` — extended review_traces (iteration, tool_input, tool_result), review diff_text + system_prompt_hash
+- `src/db/schema.ts` — added `user_installations` table to SCHEMA_V1
+- `src/db/queries.ts` — 13 new query functions for dashboard API, all using M:N joins through `user_installations`
+- `src/api/cors.ts` — `handlePreflight()` (204 for OPTIONS), `withCors()` (clone response + CORS headers). Origin validated against `env.DASHBOARD_ORIGIN` (never wildcard)
+- `src/api/middleware.ts`:
+  - `AuthContext` interface: `{ userId, githubId, githubLogin, avatarUrl }`
+  - `authenticate()` → parse `session` cookie → SHA-256 hash → D1 lookup (sessions JOIN users, check expires_at)
+  - `requireAuth()` → returns AuthContext or 401 Response
+  - `checkCsrf()` → Origin header check on POST/PATCH/PUT/DELETE mutations, reject 403 if mismatch
+  - Cookie helpers: `setSessionCookie()`, `clearSessionCookie()`, `clearOAuthStateCookie()`, `hashToken()`
+- `src/api/auth.ts`:
+  - `handleAuthLogin()` → generate random `state` (16 bytes hex), set `__oauth_state` cookie (5 min, HttpOnly), redirect to GitHub OAuth authorize URL
+  - `handleAuthCallback()` → verify `state` cookie, exchange code for token, fetch user + installations, upsert user + link installations via `user_installations`, create session (256-bit token, SHA-256 hash stored, 30-day expiry), redirect to `DASHBOARD_ORIGIN`. GitHub access token used once and discarded
+  - `handleAuthLogout()` → delete session from D1, clear cookie
+  - `handleAuthMe()` → return user JSON or 401
+- `src/api/repos.ts`:
+  - `handleGetRepos()` → returns `{ repos, installUrl }` (repos joined through user_installations)
+  - `handleSyncRepos()` → fetches repos from GitHub API via installation tokens for each user installation, upserts into D1
+  - `handlePatchRepoSettings()` → validates settings schema (max 20 patterns, max 200 chars, strictness must be lenient|balanced|strict, max 10 checklist items)
+  - `handleToggleRepo()` → enable/disable repo (verify ownership)
+- `src/api/reviews.ts` — `handleGetReviews()` (paginated, ownership-scoped), `handleGetReview()`, `handleGetReviewTrace()`
+- `src/api/usage.ts` — `handleGetUsage()` (aggregated stats, period capped at 365 days)
+- `src/index.ts` — full route dispatch:
+  - `matchRoute(pattern, pathname)` helper for `:id` parameter extraction
+  - OPTIONS preflight → webhook (no CORS) → `/auth/*` (CORS, no session auth) → `/api/*` (CORS + CSRF + session auth)
+  - Env extended with `DASHBOARD_ORIGIN`, `GITHUB_APP_SLUG`
 
-**Verify:** OAuth login works, repos listed, reviews with trace drill-down.
+**Verified:** `npx tsc --noEmit` ✅. D1 migrations applied locally ✅.
 
-### Phase 8: React Dashboard (Cloudflare Pages)
-- Vite + React + react-router-dom + @tanstack/react-query
-- Pages: Login, Repos, Reviews, ReviewDetail, Usage, Settings
-- Components: TraceViewer (accordion timeline), RepoSettings (config editor), ReviewCard
-- Deploy: `npx wrangler pages deploy dashboard/dist --project-name code-refinery-dashboard`
+### Phase 8: React Dashboard (Cloudflare Pages) ✅
+- Scaffolded `dashboard/` with Vite 6, React 19, react-router-dom 7, @tanstack/react-query 5, Tailwind CSS 3
+- `dashboard/src/lib/types.ts` — User, Repo, RepoSettings, Review, ReviewFinding, ReviewTrace, PaginatedReviews, ReposResponse, SyncReposResponse, UsageStats
+- `dashboard/src/lib/api.ts` — typed `apiFetch<T>` with `credentials: "include"`, auto 401→redirect, methods for all endpoints including `syncRepos()`
+- `dashboard/src/lib/auth.tsx` — AuthProvider context, `useAuth()` hook, `LOGIN_URL`
+- `dashboard/src/main.tsx` — ReactDOM root, QueryClientProvider, App
+- `dashboard/src/App.tsx` — BrowserRouter with protected routes
+- `dashboard/src/components/Layout.tsx` — sidebar nav with user avatar + logout
+- `dashboard/src/components/ProtectedRoute.tsx` — redirect to /login if unauthenticated
+- Pages: Login (GitHub OAuth button), Repos (sync + enable/disable + settings + install URL), Reviews (paginated with repo filter), ReviewDetail (findings by severity + TraceViewer), Usage (period selector, summary cards, bar charts), Settings (placeholder)
+- Components: ReviewCard (verdict badge), TraceViewer (expandable accordion), RepoSettings (modal with strictness/patterns/checklist)
+- `dashboard/vite.config.ts` — proxy `/api` and `/auth` to `localhost:8787` in dev
+- Deploy: `cd dashboard && npm run build && npx wrangler pages deploy dist --project-name code-refinery-dashboard`
 
-**Verify:** Full flow: login → repos → reviews → trace detail. Edit settings → new review reflects them.
+**Verified:** `npx tsc --noEmit` ✅. `npm run build` ✅ (297KB JS, 16KB CSS).
 
 ### Phase 9: Review Configuration (Unified)
 - ReviewConfig: strictness, ignore_patterns, custom_checklist
@@ -326,6 +377,10 @@ npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
 npx wrangler secret put AI_GATEWAY_ID
 ```
 
+**Environment variables (wrangler.toml `[vars]`):**
+- `DASHBOARD_ORIGIN` — dashboard URL, e.g. `https://code-refinery-dashboard.pages.dev` (never wildcard, used for CORS + CSRF + OAuth redirect)
+- `GITHUB_APP_SLUG` — GitHub App slug, e.g. `code-refinery` (used to build install URL: `github.com/apps/{slug}/installations/new`)
+
 Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Gateway `code-refinery`, Pages `code-refinery-dashboard`.
 
 ---
@@ -346,7 +401,7 @@ Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Ga
 - All GitHub API calls happen in the Worker via fetch(), never in the sandbox
 - Sandbox only runs local operations: file reads, git commands, allowlisted shell commands via `sandbox.exec()`
 - Private keys stored as Cloudflare secrets, passed to sandbox only as short-lived installation tokens
-- Agent loop capped at 20 iterations with structured `<review>` JSON output
+- Agent loop has dynamic iteration budget (10/15/20 based on changed file count) with structured `<review>` JSON output
 - D1 tracks every agent turn for observability (review_traces table)
 
 ### Sandbox Conventions
@@ -363,9 +418,12 @@ Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Ga
 - `setupRepo()` handles fork PRs: tries branch fetch first, falls back to SHA fetch if branch not on remote
 - `shellQuote()` wraps values in single quotes with interior `'` escaped — used for URLs, patterns
 - `scrubTokens()` redacts credentials from URLs in error messages/logs
-- `searchContent()` wraps ripgrep (`rg`) with input validation, returns empty string for no matches (rg exit 1 = no matches, not an error)
+- `runCommand()` accepts optional `cwd` parameter for subdirectory execution (resolved relative to REPO_DIR)
+- `searchContent()` wraps `git grep` (not ripgrep) with input validation, returns empty string for no matches (exit 1 = no matches, not an error). Always available, only searches tracked files, respects .gitignore via index
 - `findFiles()` wraps `find` with pattern validation and max depth limit (default 10, max 15)
-- rg and find are NOT in `COMMAND_ALLOWLIST` — only accessible via `searchContent()`/`findFiles()` which validate inputs. Raw rg/find via `runCommand` would expose dangerous flags like `--pre`
+- Command allowlist is **static-analysis only** — NO test runners (npm test, pytest, cargo test, go test, etc.) as they execute attacker-controlled code from untrusted PRs. Delegate test execution to CI/CD
+- Allowlist includes: vulnerability audits (npm audit, pip-audit, cargo audit, bundle audit, go list -m), linters (ruff, mypy, go vet, cargo clippy, rubocop), git read-only commands
+- rg and find are NOT in `COMMAND_ALLOWLIST` — only accessible via `searchContent()`/`findFiles()` which validate inputs
 
 ### D1 / Database Conventions
 - All queries use parameterized prepared statements (`.bind()`) — never string interpolation in SQL
@@ -379,6 +437,18 @@ Cloudflare resources: Queue `pr-review-jobs` + DLQ, D1 `code-refinery-db`, AI Ga
 - `job_dedup` table gates webhook processing: SHA dedup (UNIQUE constraint), per-repo rate limit (50/hr), PR debounce (supersede older pending jobs for same PR)
 - `job_dedup.status` lifecycle: `queued` → `processing` → `done`/`failed`/`superseded`
 - Queue consumer checks `isJobSuperseded()` before starting expensive agent loop work
+
+### API / Auth Conventions
+- GitHub OAuth uses a **separate OAuth App** (GITHUB_CLIENT_ID/SECRET), not the GitHub App used for webhooks
+- OAuth `state` parameter: random 16 bytes hex, stored in `__oauth_state` cookie (5 min, HttpOnly, Secure, SameSite=Lax), verified on callback
+- Session token: 256-bit entropy (`crypto.getRandomValues`), SHA-256 hash stored in D1 (raw token never stored). 30-day expiry
+- Cookie: `session`, HttpOnly, Secure, SameSite=None, Path=/ (SameSite=None required for cross-origin Pages → Worker)
+- GitHub access token: used once in OAuth callback to fetch user info + installations, then discarded (never stored)
+- CSRF on mutations: `checkCsrf()` verifies `Origin` header matches `env.DASHBOARD_ORIGIN` on POST/PATCH/PUT/DELETE. Applied before any handler runs
+- CORS: `DASHBOARD_ORIGIN` env var (never wildcard). `Access-Control-Allow-Credentials: true`
+- User–repo ownership: M:N `user_installations` join table. All API reads and writes verify ownership through this join
+- `settings_json` validation: max 20 ignore patterns (200 chars each), max 10 checklist items (500 chars each), strictness must be lenient|balanced|strict
+- Repo sync: `POST /api/repos/sync` fetches repos from GitHub API for each user installation, paginates through all repos, upserts into D1
 
 ### Wrangler / Cloudflare Conventions
 - `[[containers]]` uses double-bracket (array) TOML syntax, not `[containers]`

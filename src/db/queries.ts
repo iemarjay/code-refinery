@@ -2,6 +2,14 @@ import type { AgentTurn } from "../agent/loop";
 
 // --- Row types ---
 
+export interface DbUser {
+  id: number;
+  github_id: number;
+  github_login: string;
+  avatar_url: string | null;
+  created_at: string;
+}
+
 export interface DbInstallation {
   id: number;
   github_installation_id: number;
@@ -45,6 +53,8 @@ export interface DbReview {
   lines_added: number | null;
   lines_removed: number | null;
   active_skills_json: string | null;
+  diff_text: string | null;
+  system_prompt_hash: string | null;
   created_at: string;
 }
 
@@ -55,7 +65,12 @@ export interface DbReviewTrace {
   role: string;
   content_json: string;
   tool_name: string | null;
+  tool_input: string | null;
+  tool_result: string | null;
   tokens_used: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  iteration: number | null;
 }
 
 // --- Write queries ---
@@ -146,6 +161,8 @@ export interface InsertReviewParams {
   linesAdded?: number;
   linesRemoved?: number;
   activeSkillsJson?: string;
+  diffText?: string;
+  systemPromptHash?: string;
 }
 
 export async function insertReview(
@@ -161,8 +178,8 @@ export async function insertReview(
         model, input_tokens, output_tokens, duration_ms,
         setup_duration_ms, sandbox_warm,
         files_changed, lines_added, lines_removed,
-        active_skills_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        active_skills_json, diff_text, system_prompt_hash
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       params.repoId,
@@ -189,6 +206,8 @@ export async function insertReview(
       params.linesAdded ?? null,
       params.linesRemoved ?? null,
       params.activeSkillsJson ?? null,
+      params.diffText ?? null,
+      params.systemPromptHash ?? null,
     )
     .run();
 
@@ -206,22 +225,25 @@ export async function insertReviewTraces(
     db
       .prepare(
         `INSERT INTO review_traces (
-          review_id, turn_number, role, content_json, tool_name, tokens_used
-        ) VALUES (?, ?, ?, ?, ?, ?)`,
+          review_id, turn_number, role, content_json, tool_name,
+          tool_input, tool_result,
+          tokens_used, input_tokens, output_tokens, iteration
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         reviewId,
         turn.turnNumber,
         turn.role,
-        JSON.stringify({
-          content: turn.content,
-          toolInput: turn.toolInput,
-          toolResult: turn.toolResult,
-        }),
+        JSON.stringify({ content: turn.content }),
         turn.toolName ?? null,
+        turn.toolInput ?? null,
+        turn.toolResult ?? null,
         turn.inputTokens != null && turn.outputTokens != null
           ? turn.inputTokens + turn.outputTokens
           : null,
+        turn.inputTokens ?? null,
+        turn.outputTokens ?? null,
+        turn.iteration,
       ),
   );
 
@@ -431,4 +453,393 @@ export async function getRepoSettings(
   } catch {
     return null;
   }
+}
+
+// --- User queries ---
+
+export async function upsertUser(
+  db: D1Database,
+  githubId: number,
+  githubLogin: string,
+  avatarUrl: string | null,
+): Promise<number> {
+  const existing = await db
+    .prepare("SELECT id, github_login, avatar_url FROM users WHERE github_id = ?")
+    .bind(githubId)
+    .first<{ id: number; github_login: string; avatar_url: string | null }>();
+
+  if (existing) {
+    // Update login/avatar if changed
+    if (existing.github_login !== githubLogin || existing.avatar_url !== avatarUrl) {
+      await db
+        .prepare("UPDATE users SET github_login = ?, avatar_url = ? WHERE id = ?")
+        .bind(githubLogin, avatarUrl, existing.id)
+        .run();
+    }
+    return existing.id;
+  }
+
+  try {
+    const result = await db
+      .prepare(
+        "INSERT INTO users (github_id, github_login, avatar_url) VALUES (?, ?, ?)",
+      )
+      .bind(githubId, githubLogin, avatarUrl)
+      .run();
+    return result.meta.last_row_id as number;
+  } catch {
+    // UNIQUE constraint race
+    const row = await db
+      .prepare("SELECT id FROM users WHERE github_id = ?")
+      .bind(githubId)
+      .first<{ id: number }>();
+    if (row) return row.id;
+    throw new Error(`Failed to upsert user ${githubId}`);
+  }
+}
+
+// --- Session queries ---
+
+export async function createSession(
+  db: D1Database,
+  userId: number,
+  tokenHash: string,
+  expiresAt: string,
+): Promise<number> {
+  const result = await db
+    .prepare(
+      "INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+    )
+    .bind(userId, tokenHash, expiresAt)
+    .run();
+  return result.meta.last_row_id as number;
+}
+
+export interface SessionWithUser {
+  sessionId: number;
+  userId: number;
+  githubId: number;
+  githubLogin: string;
+  avatarUrl: string | null;
+}
+
+export async function getSessionWithUser(
+  db: D1Database,
+  tokenHash: string,
+): Promise<SessionWithUser | null> {
+  const row = await db
+    .prepare(
+      `SELECT s.id as session_id, u.id as user_id, u.github_id, u.github_login, u.avatar_url
+       FROM sessions s
+       JOIN users u ON s.user_id = u.id
+       WHERE s.token_hash = ? AND s.expires_at > datetime('now')`,
+    )
+    .bind(tokenHash)
+    .first<{
+      session_id: number;
+      user_id: number;
+      github_id: number;
+      github_login: string;
+      avatar_url: string | null;
+    }>();
+
+  if (!row) return null;
+
+  return {
+    sessionId: row.session_id,
+    userId: row.user_id,
+    githubId: row.github_id,
+    githubLogin: row.github_login,
+    avatarUrl: row.avatar_url,
+  };
+}
+
+export async function deleteSession(
+  db: D1Database,
+  tokenHash: string,
+): Promise<void> {
+  await db
+    .prepare("DELETE FROM sessions WHERE token_hash = ?")
+    .bind(tokenHash)
+    .run();
+}
+
+export async function deleteExpiredSessions(db: D1Database): Promise<void> {
+  await db
+    .prepare("DELETE FROM sessions WHERE expires_at < datetime('now')")
+    .run();
+}
+
+// --- User-installation linking (M:N) ---
+
+export async function linkInstallationsToUser(
+  db: D1Database,
+  userId: number,
+  githubInstallationIds: number[],
+): Promise<void> {
+  if (githubInstallationIds.length === 0) return;
+
+  const statements = githubInstallationIds.map((ghInstId) =>
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO user_installations (user_id, installation_id)
+         SELECT ?, id FROM installations WHERE github_installation_id = ?`,
+      )
+      .bind(userId, ghInstId),
+  );
+
+  await db.batch(statements);
+}
+
+// --- Installation IDs for user ---
+
+export async function getInstallationIdsForUser(
+  db: D1Database,
+  userId: number,
+): Promise<number[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT i.github_installation_id
+       FROM installations i
+       JOIN user_installations ui ON ui.installation_id = i.id
+       WHERE ui.user_id = ? AND i.status = 'active'`,
+    )
+    .bind(userId)
+    .all<{ github_installation_id: number }>();
+
+  return results.map((r) => r.github_installation_id);
+}
+
+// --- Repos for user (via user_installations join table) ---
+
+export interface DbRepoWithInstallation extends DbRepo {
+  installation_github_id: number;
+}
+
+export async function getReposForUser(
+  db: D1Database,
+  userId: number,
+): Promise<DbRepoWithInstallation[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT r.*, i.github_installation_id as installation_github_id
+       FROM repos r
+       JOIN installations i ON r.installation_id = i.id
+       JOIN user_installations ui ON ui.installation_id = i.id
+       WHERE ui.user_id = ?
+       ORDER BY r.full_name`,
+    )
+    .bind(userId)
+    .all<DbRepoWithInstallation>();
+
+  return results;
+}
+
+// --- Paginated reviews ---
+
+export interface PaginatedResult<T> {
+  rows: T[];
+  total: number;
+}
+
+export async function getReviewsPaginated(
+  db: D1Database,
+  params: { repoId?: number; userId: number; page: number; limit: number },
+): Promise<PaginatedResult<DbReview>> {
+  const offset = (params.page - 1) * params.limit;
+
+  if (params.repoId) {
+    // Filter by specific repo (ownership already verified by caller)
+    const [countResult, dataResult] = await db.batch([
+      db
+        .prepare("SELECT COUNT(*) as cnt FROM reviews WHERE repo_id = ?")
+        .bind(params.repoId),
+      db
+        .prepare(
+          "SELECT * FROM reviews WHERE repo_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        )
+        .bind(params.repoId, params.limit, offset),
+    ]);
+
+    const total = (countResult.results[0] as { cnt: number }).cnt;
+    const rows = dataResult.results as unknown as DbReview[];
+    return { rows, total };
+  }
+
+  // All reviews for user's repos
+  const [countResult, dataResult] = await db.batch([
+    db
+      .prepare(
+        `SELECT COUNT(*) as cnt FROM reviews rv
+         JOIN repos r ON rv.repo_id = r.id
+         JOIN user_installations ui ON ui.installation_id = r.installation_id
+         WHERE ui.user_id = ?`,
+      )
+      .bind(params.userId),
+    db
+      .prepare(
+        `SELECT rv.* FROM reviews rv
+         JOIN repos r ON rv.repo_id = r.id
+         JOIN user_installations ui ON ui.installation_id = r.installation_id
+         WHERE ui.user_id = ?
+         ORDER BY rv.created_at DESC LIMIT ? OFFSET ?`,
+      )
+      .bind(params.userId, params.limit, offset),
+  ]);
+
+  const total = (countResult.results[0] as { cnt: number }).cnt;
+  const rows = dataResult.results as unknown as DbReview[];
+  return { rows, total };
+}
+
+// --- Repo settings updates ---
+
+export async function updateRepoSettings(
+  db: D1Database,
+  repoId: number,
+  settingsJson: string,
+): Promise<void> {
+  await db
+    .prepare("UPDATE repos SET settings_json = ? WHERE id = ?")
+    .bind(settingsJson, repoId)
+    .run();
+}
+
+export async function updateRepoEnabled(
+  db: D1Database,
+  repoId: number,
+  enabled: boolean,
+): Promise<void> {
+  await db
+    .prepare("UPDATE repos SET enabled = ? WHERE id = ?")
+    .bind(enabled ? 1 : 0, repoId)
+    .run();
+}
+
+// --- Ownership verification ---
+
+export async function verifyUserOwnsRepo(
+  db: D1Database,
+  userId: number,
+  repoId: number,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT 1 FROM repos r
+       JOIN user_installations ui ON ui.installation_id = r.installation_id
+       WHERE r.id = ? AND ui.user_id = ?`,
+    )
+    .bind(repoId, userId)
+    .first();
+
+  return row !== null;
+}
+
+export async function verifyUserOwnsReview(
+  db: D1Database,
+  userId: number,
+  reviewId: number,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT 1 FROM reviews rv
+       JOIN repos r ON rv.repo_id = r.id
+       JOIN user_installations ui ON ui.installation_id = r.installation_id
+       WHERE rv.id = ? AND ui.user_id = ?`,
+    )
+    .bind(reviewId, userId)
+    .first();
+
+  return row !== null;
+}
+
+// --- Usage stats ---
+
+export interface UsageStats {
+  totalReviews: number;
+  completedReviews: number;
+  failedReviews: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalDurationMs: number;
+  avgDurationMs: number;
+  reviewsByDay: Array<{ date: string; count: number }>;
+  reviewsByRepo: Array<{ repoName: string; count: number }>;
+}
+
+export async function getUsageStats(
+  db: D1Database,
+  userId: number,
+  periodDays: number,
+): Promise<UsageStats> {
+  const sinceDate = `datetime('now', '-${Math.min(periodDays, 365)} days')`;
+
+  const [summaryResult, byDayResult, byRepoResult] = await db.batch([
+    db
+      .prepare(
+        `SELECT
+           COUNT(*) as total_reviews,
+           SUM(CASE WHEN rv.status = 'completed' THEN 1 ELSE 0 END) as completed,
+           SUM(CASE WHEN rv.status = 'failed' THEN 1 ELSE 0 END) as failed,
+           COALESCE(SUM(rv.input_tokens), 0) as input_tokens,
+           COALESCE(SUM(rv.output_tokens), 0) as output_tokens,
+           COALESCE(SUM(rv.duration_ms), 0) as total_duration,
+           COALESCE(AVG(rv.duration_ms), 0) as avg_duration
+         FROM reviews rv
+         JOIN repos r ON rv.repo_id = r.id
+         JOIN user_installations ui ON ui.installation_id = r.installation_id
+         WHERE ui.user_id = ? AND rv.created_at > ${sinceDate}`,
+      )
+      .bind(userId),
+    db
+      .prepare(
+        `SELECT date(rv.created_at) as date, COUNT(*) as count
+         FROM reviews rv
+         JOIN repos r ON rv.repo_id = r.id
+         JOIN user_installations ui ON ui.installation_id = r.installation_id
+         WHERE ui.user_id = ? AND rv.created_at > ${sinceDate}
+         GROUP BY date(rv.created_at)
+         ORDER BY date ASC`,
+      )
+      .bind(userId),
+    db
+      .prepare(
+        `SELECT r.full_name as repo_name, COUNT(*) as count
+         FROM reviews rv
+         JOIN repos r ON rv.repo_id = r.id
+         JOIN user_installations ui ON ui.installation_id = r.installation_id
+         WHERE ui.user_id = ? AND rv.created_at > ${sinceDate}
+         GROUP BY r.full_name
+         ORDER BY count DESC`,
+      )
+      .bind(userId),
+  ]);
+
+  const summary = summaryResult.results[0] as {
+    total_reviews: number;
+    completed: number;
+    failed: number;
+    input_tokens: number;
+    output_tokens: number;
+    total_duration: number;
+    avg_duration: number;
+  };
+
+  return {
+    totalReviews: summary.total_reviews,
+    completedReviews: summary.completed,
+    failedReviews: summary.failed,
+    totalInputTokens: summary.input_tokens,
+    totalOutputTokens: summary.output_tokens,
+    totalDurationMs: summary.total_duration,
+    avgDurationMs: Math.round(summary.avg_duration),
+    reviewsByDay: byDayResult.results as unknown as Array<{
+      date: string;
+      count: number;
+    }>,
+    reviewsByRepo: byRepoResult.results as unknown as Array<{
+      repoName: string;
+      count: number;
+    }>,
+  };
 }

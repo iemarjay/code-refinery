@@ -1,6 +1,7 @@
 name = "code-refinery"
 main = "src/index.ts"
 compatibility_date = "2025-02-01"
+account_id = "9eaa877bd6c6e77ff3913a176e4322a9"
 
 # Queue — producer
 [[queues.producers]]
@@ -18,7 +19,7 @@ dead_letter_queue = "pr-review-jobs-dlq"
 [[d1_databases]]
 binding = "DB"
 database_name = "code-refinery-db"
-database_id = "placeholder-will-be-replaced-after-d1-create"
+database_id = "535fed80-0d2d-4cdb-aa70-65f4ebf11793"
 migrations_dir = "migrations"
 
 # Durable Objects — Sandbox

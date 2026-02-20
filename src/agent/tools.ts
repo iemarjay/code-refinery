@@ -10,6 +10,7 @@ import {
   SandboxError,
   REPO_DIR,
 } from "../sandbox/helpers";
+import { queryOSV, type VulnEcosystem } from "./vuln";
 import type { SandboxToolName } from "./skills/types";
 
 export const TOOL_DEFINITIONS: Record<SandboxToolName, Anthropic.Messages.Tool> = {
@@ -53,13 +54,21 @@ export const TOOL_DEFINITIONS: Record<SandboxToolName, Anthropic.Messages.Tool> 
       "Allowed: test runners (npm test, pytest, go test, cargo test, etc.), " +
       "linters, type checkers, and git commands. " +
       "Returns stdout, stderr, and exit code. Non-zero exit is not an error — " +
-      "test failures are useful information.",
+      "test failures are useful information. " +
+      "Use the 'cwd' parameter to run in a subdirectory (e.g. 'apps/api'). " +
+      "Do NOT use 'cd' — it is not allowed.",
     input_schema: {
       type: "object" as const,
       properties: {
         command: {
           type: "string",
           description: "The command to run (must match allowlist)",
+        },
+        cwd: {
+          type: "string",
+          description:
+            "Subdirectory to run in, relative to repo root (e.g. 'apps/api'). " +
+            "Omit to run from the repo root.",
         },
       },
       required: ["command"],
@@ -86,9 +95,10 @@ export const TOOL_DEFINITIONS: Record<SandboxToolName, Anthropic.Messages.Tool> 
   search_content: {
     name: "search_content",
     description:
-      "Search file contents using ripgrep. Use this to find function definitions, " +
-      "usages, imports, patterns, and string literals across the codebase. " +
-      "Supports regex. Returns matching lines with file paths and line numbers.",
+      "Search file contents using git grep. Use this to find function definitions, " +
+      "usages, imports, patterns, and string literals across tracked files. " +
+      "Supports regex. Returns matching lines with file paths and line numbers. " +
+      "Automatically respects .gitignore.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -135,6 +145,37 @@ export const TOOL_DEFINITIONS: Record<SandboxToolName, Anthropic.Messages.Tool> 
       required: ["pattern"],
     },
   },
+
+  check_vulnerabilities: {
+    name: "check_vulnerabilities",
+    description:
+      "Check packages for known security vulnerabilities using the OSV.dev database. " +
+      "Read the project's dependency file (package.json, go.mod, requirements.txt, Cargo.toml, Gemfile) " +
+      "to extract package names and versions, then pass them here. Max 50 packages per call.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        ecosystem: {
+          type: "string",
+          enum: ["npm", "PyPI", "Go", "crates.io", "RubyGems", "Maven"],
+          description: "The package ecosystem to query",
+        },
+        packages: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "Package name" },
+              version: { type: "string", description: "Package version (e.g. '4.17.21')" },
+            },
+            required: ["name", "version"],
+          },
+          description: "List of packages to check (max 50)",
+        },
+      },
+      required: ["ecosystem", "packages"],
+    },
+  },
 };
 
 export async function routeToolCall(
@@ -169,8 +210,8 @@ export async function routeToolCall(
       }
 
       case "run_command": {
-        const { command } = toolInput as { command: string };
-        const result = await runCommand(sandbox, command);
+        const { command, cwd } = toolInput as { command: string; cwd?: string };
+        const result = await runCommand(sandbox, command, cwd);
         const output = [
           `Exit code: ${result.exitCode}`,
           result.stdout ? `stdout:\n${result.stdout}` : "",
@@ -221,6 +262,29 @@ export async function routeToolCall(
           ? `\n... and ${files.length - 500} more`
           : "";
         return { result: capped.join("\n") + suffix, isError: false };
+      }
+
+      case "check_vulnerabilities": {
+        const { ecosystem, packages } = toolInput as {
+          ecosystem: VulnEcosystem;
+          packages: Array<{ name: string; version: string }>;
+        };
+        const results = await queryOSV({ ecosystem, packages });
+        if (results.length === 0) {
+          return {
+            result: `No known vulnerabilities found for ${packages.length} ${ecosystem} packages.`,
+            isError: false,
+          };
+        }
+        const formatted = results
+          .map((r) => {
+            const vulns = r.vulnerabilities
+              .map((v) => `  - ${v.id} [${v.severity}]: ${v.summary} (fixed in ${v.fixed})`)
+              .join("\n");
+            return `${r.package}@${r.version}:\n${vulns}`;
+          })
+          .join("\n\n");
+        return { result: formatted.slice(0, 30_000), isError: false };
       }
 
       default:
