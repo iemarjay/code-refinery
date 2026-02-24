@@ -1,0 +1,104 @@
+name: "Code Refinery"
+description: "Automated PR review — security + code quality passes using Claude Code CLI in full agentic mode"
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  github_token:
+    description: "GitHub token for PR API calls"
+    default: ${{ github.token }}
+  anthropic_api_key:
+    description: "Anthropic API key (direct API users)"
+    default: ""
+  claude_code_oauth_token:
+    description: "OAuth token for Claude Pro/Max subscribers (from claude setup-token)"
+    default: ""
+  model:
+    description: "Claude model to use (sonnet or opus)"
+    default: "sonnet"
+  strictness:
+    description: "Review strictness level (lenient, normal, strict)"
+    default: "normal"
+  custom_instructions:
+    description: "Extra instructions appended to both review prompts"
+    default: ""
+  exclude_patterns:
+    description: "Glob patterns for files to skip (newline-separated)"
+    default: ""
+  fail_on_critical:
+    description: "Exit with code 1 if critical findings are found"
+    default: "false"
+  auto_merge:
+    description: "Auto-merge PR if review verdict is approve"
+    default: "false"
+  auto_merge_method:
+    description: "Merge method when auto-merging (squash, merge, rebase)"
+    default: "squash"
+  max_turns:
+    description: "Max agent turns per Claude invocation (API key cost control)"
+    default: ""
+  max_budget_usd:
+    description: "Max budget in USD per Claude invocation (API key cost control)"
+    default: ""
+  timeout_minutes:
+    description: "Timeout in minutes per Claude invocation"
+    default: "20"
+  anthropic_base_url:
+    description: "Custom API base URL (for proxies, Cloudflare AI Gateway)"
+    default: ""
+  use_bedrock:
+    description: "Use AWS Bedrock as provider"
+    default: "false"
+  use_vertex:
+    description: "Use Google Vertex AI as provider"
+    default: "false"
+  use_foundry:
+    description: "Use Azure Foundry as provider"
+    default: "false"
+
+outputs:
+  findings_count:
+    description: "Total number of findings after filtering"
+    value: ${{ steps.review.outputs.findings_count }}
+  critical_count:
+    description: "Number of critical findings"
+    value: ${{ steps.review.outputs.critical_count }}
+  verdict:
+    description: "Review verdict (approve, comment, request_changes)"
+    value: ${{ steps.review.outputs.verdict }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install Claude Code CLI
+      shell: bash
+      run: npm install -g @anthropic-ai/claude-code
+
+    - name: Run review
+      id: review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic_base_url }}
+        CLAUDE_CODE_USE_BEDROCK: ${{ inputs.use_bedrock == 'true' && '1' || '' }}
+        CLAUDE_CODE_USE_VERTEX: ${{ inputs.use_vertex == 'true' && '1' || '' }}
+        CLAUDE_CODE_USE_FOUNDRY: ${{ inputs.use_foundry == 'true' && '1' || '' }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_STRICTNESS: ${{ inputs.strictness }}
+        INPUT_CUSTOM_INSTRUCTIONS: ${{ inputs.custom_instructions }}
+        INPUT_EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
+        INPUT_FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
+        INPUT_AUTO_MERGE: ${{ inputs.auto_merge }}
+        INPUT_AUTO_MERGE_METHOD: ${{ inputs.auto_merge_method }}
+        INPUT_MAX_TURNS: ${{ inputs.max_turns }}
+        INPUT_MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+      run: node ${{ github.action_path }}/dist/review.js
