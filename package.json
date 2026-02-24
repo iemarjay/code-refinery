@@ -1,0 +1,13 @@
+{
+  "name": "code-refinery",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/review.ts --bundle --platform=node --target=node20 --outfile=dist/review.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0"
+  }
+}
