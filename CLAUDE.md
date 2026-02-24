@@ -7,6 +7,7 @@ GitHub Action for automated PR review — two dedicated passes (security + code 
 - **NEVER modify files in `vendor/`** — those are cloned reference repos (Anthropic's actions), read-only for studying prompts and patterns.
 - **Always check `dist/review.js` into git** after building — standard for GitHub Actions distribution.
 - When editing prompts in `prompts.ts`, explain the reasoning — prompt quality determines review quality.
+- **After completing each phase**, update this CLAUDE.md: mark the phase ✅, document what was built (files, functions, key decisions), and record the verification results. This is the living spec — keep it accurate.
 
 ## Architecture
 
@@ -107,7 +108,7 @@ package.json                  — Build deps only (esbuild, typescript)
 tsconfig.json
 src/
   review.ts                   — Main orchestrator (entry point)
-  types.ts                    — ReviewFinding, ReviewOutput, ClaudeJsonResult interfaces
+  types.ts                    — ReviewFinding, ReviewOutput, ClaudeJsonResult, PRData, PRFile, MergeResult, ActionConfig
   schema.ts                   — JSON schema for --json-schema constrained output
   prompts.ts                  — Security prompt, code quality prompt, user context builder
   trivial.ts                  — Trivial PR detection (docs/config/lock files)
@@ -136,45 +137,55 @@ Created root-level config files so `npm install && npm run build` works.
 
 **Verified:** `npm install` (29 packages), `npm run build` → `dist/review.js` (1.4kb), `npx tsc --noEmit` passes, `node dist/review.js` runs and prints config stub.
 
-### Phase 2: GitHub Integration ⬜
-Fetch PR data and post comments using `gh` CLI.
+### Phase 2: GitHub Integration ✅
+All GitHub API interaction via `gh` CLI in `src/github.ts`. Zero npm runtime deps.
 
-- `src/github.ts`:
-  - `getPRData(repo, prNumber)` — PR metadata + files via `gh api`
-  - `getPRDiff(repo, prNumber)` — unified diff via `gh api` with diff Accept header
-  - `postInlineReview(repo, prNumber, headSha, findings, prFiles)` — `POST /pulls/{n}/reviews` with inline comments array
-  - `postSummaryComment(repo, prNumber, body)` — `POST /issues/{n}/comments`
-  - `mergePR(repo, prNumber, method)` — `PUT /pulls/{n}/merge` with squash/merge/rebase. Returns success or failure reason
-  - Duplicate detection — check for `<!-- code-refinery-review -->` marker, update existing if found
+- `src/types.ts` — Added `PRFile` (filename, status, additions, deletions, changes, patch?, previous_filename?), `PRData` (number, title, body, user, headRef, headSha, baseRef, additions, deletions, changedFiles, files), `MergeResult` (merged, message, sha?).
+- `src/github.ts` — All GitHub interaction through two internal helpers:
+  - `ghApi<T>(endpoint, method, data?, headers?)` — wraps `execFileSync("gh", ["api", ...])`, returns parsed JSON. Uses `--input -` for request bodies (stdin), `--header` for custom Accept. 30s timeout.
+  - `ghApiRaw(endpoint, headers?)` — returns raw string (for diff endpoint). 60s timeout.
+  - `getPRData(repo, prNumber)` — `GET /pulls/{n}` for metadata + paginated `GET /pulls/{n}/files?per_page=100` (up to 30 pages / 3000 files). Maps to flat `PRData` interface.
+  - `getPRDiff(repo, prNumber)` — `GET /pulls/{n}` with `Accept: application/vnd.github.diff`. Returns unified diff string.
+  - `postSummaryComment(repo, prNumber, body)` — Duplicate detection via `findExistingComment()` scanning issue comments for `<!-- code-refinery-review -->` marker. Updates existing (`PATCH /issues/comments/{id}`) or creates new (`POST /issues/{n}/comments`).
+  - `postInlineReview(repo, prNumber, headSha, findings, prFiles)` — Filters to critical+warning only. Batch-first via `POST /pulls/{n}/reviews` with `{ commit_id, event: "COMMENT", comments }`. On 422 (line outside diff hunk), falls back to individual `POST /pulls/{n}/comments` per finding, skipping failures.
+  - `mergePR(repo, prNumber, method)` — `PUT /pulls/{n}/merge` with `{ merge_method }`. Returns `MergeResult` (never throws). Parses 405/409/403 into human-friendly messages.
+  - Error philosophy: read functions (`getPRData`, `getPRDiff`) let errors propagate (fatal). Write functions catch and log internally (best-effort). `mergePR` returns result object.
 
-**Verify:** Run locally with `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, `PR_NUMBER` env vars. Confirm PR data fetched.
+**Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (1.4kb).
 
-### Phase 3: Trivial PR Detection + Filtering ⬜
+### Phase 3: Trivial PR Detection + Filtering ✅
 Skip unnecessary reviews and filter false positives.
 
-- `src/trivial.ts` — `isTrivialPR()`: skip when ALL changed files are docs/config/lock AND total lines ≤ threshold
-- `src/filter.ts` — `filterFindings()`: hard regex rules adapted from Anthropic's `HardExclusionRules`:
-  - DoS/resource exhaustion → exclude
-  - Rate limiting recommendations → exclude
-  - Memory safety in non-C/C++ → exclude
-  - Findings in .md files → exclude
-  - Findings in lock/generated files → exclude
-  - Confidence < 0.7 → exclude
-  - Open redirects → exclude
+- `src/trivial.ts` — Two exports:
+  - `isTrivialFile(filename)` — checks a single filename against trivial patterns (docs, config, lockfiles, CI, assets, license). Exported for testability.
+  - `isTrivialPR(files: PRFile[])` — returns `true` when ALL files are trivial AND total changed lines ≤ 500. Logs non-trivial files or line count reason on `false`.
+  - Pattern categories: documentation (`.md`, `.rst`, `.txt`, `.adoc`), config (`.yml`, `.yaml`, `.toml`, `.ini`), lockfiles (exact names like `package-lock.json`, `yarn.lock`), CI paths (`.github/`, `.circleci/`), assets (images, fonts), license files, misc config (`.editorconfig`, `.gitignore`, `.prettierrc*`, `.eslintrc*`).
+- `src/filter.ts` — `filterFindings(findings: ReviewFinding[]): ReviewFinding[]` — returns only findings that survive all rules. 10 filter rules ported from Anthropic's `HardExclusionRules` (`vendor/claude-code-security-review/claudecode/findings_filter.py`):
+  1. Markdown files → exclude
+  2. Lockfile/generated files (`dist/`, `build/`, `vendor/`, `*.min.js`, `*.d.ts`) → exclude
+  3. Low confidence (`< 0.7`) → exclude
+  4. DoS/resource exhaustion → exclude
+  5. Rate limiting recommendations → exclude
+  6. Resource leaks → exclude
+  7. Open redirects → exclude
+  8. Regex injection → exclude
+  9. Memory safety in non-C/C++ → exclude
+  10. SSRF in HTML files → exclude
+  - Each rule is a named `FilterRule` object. Logs each exclusion with rule name, file, line, and category.
 
-**Verify:** Call functions with test data, confirm correct filtering.
+**Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (1.4kb).
 
-### Phase 4: Claude CLI Invocation ⬜
+### Phase 4: Claude CLI Invocation ✅
 Invoke `claude` in full agentic mode with constrained JSON output.
 
-- `src/claude.ts` — `invokeClaude({ prompt, systemPrompt, repoDir, model, maxTurns?, maxBudgetUsd?, timeoutMinutes, disallowedTools? })`:
-  - Build args: `--output-format json --model {model} --json-schema '{schema}' --append-system-prompt "{systemPrompt}" --disallowed-tools "Bash(ps:*)"`
-  - Optional: `--max-turns` and `--max-budget-usd` for API key users
-  - `execFileSync('claude', args, { input: prompt, cwd: repoDir, timeout, encoding: 'utf-8' })`
-  - Parse JSON envelope: `structured_output` first, fall back to `result` string parse
-  - Provider env vars flow through `process.env` automatically
+- `src/claude.ts` — Two exports:
+  - `InvokeClaudeOptions` interface — `prompt`, `systemPrompt`, `repoDir`, `model`, optional `maxTurns`/`maxBudgetUsd`, `timeoutMinutes`, `disallowedTools` (default `"Bash(ps:*)"`).
+  - `invokeClaude(options): ReviewOutput` — builds CLI args array (`--output-format json --model {model} --json-schema {reviewSchemaJson} --append-system-prompt {systemPrompt} --disallowed-tools {disallowedTools}`), conditionally appends `--max-turns` and `--max-budget-usd` when defined. Executes via `execFileSync("claude", args, { input: prompt, cwd: repoDir, timeout: minutes→ms })`.
+  - JSON parsing: two-tier strategy via internal `parseClaudeOutput()` — prefers `structured_output` (constrained decoding), falls back to parsing `result` string, validates `findings` array exists.
+  - Error handling: never throws. Returns empty `ReviewOutput` with `review_completed: false` on timeout, CLI failure, or parse failure. Logs human-readable error messages (timeout duration, exit code, stderr snippet).
+  - Provider env vars (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_USE_BEDROCK`, etc.) flow through `process.env` automatically — zero provider-specific code.
 
-**Verify:** Invoke against a real repo directory, confirm structured JSON matches schema.
+**Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (1.4kb).
 
 ### Phase 5: Prompts (Security + Code Quality) ⬜
 Two dedicated prompts — the most important phase.
