@@ -21,6 +21,7 @@ action.yml (composite GitHub Action)
   │
   ├─ node dist/review.js
   │   │
+  │   ├─ Validate Claude CLI available
   │   ├─ Fetch PR data + diff (gh CLI)
   │   ├─ Trivial PR check → skip if docs/config only
   │   │
@@ -34,7 +35,7 @@ action.yml (composite GitHub Action)
   │   │      --append-system-prompt "{quality_prompt}"
   │   │      (full agentic mode, Sonnet default, prompt via stdin)
   │   │
-  │   ├─ Merge findings + false positive filter (hard regex rules)
+  │   ├─ Merge findings + false positive filter (hard regex rules + generated file markers)
   │   │
   │   ├─ Post inline review comments (critical + warning)
   │   └─ Post summary comment (full overview)
@@ -108,7 +109,7 @@ package.json                  — Build deps only (esbuild, typescript)
 tsconfig.json
 src/
   review.ts                   — Main orchestrator (entry point)
-  types.ts                    — ReviewFinding, ReviewOutput, ClaudeJsonResult, PRData, PRFile, MergeResult, ActionConfig
+  types.ts                    — ReviewFinding, ReviewOutput, ClaudeJsonResult, InvokeResult, PRData, PRFile, MergeResult, ActionConfig
   schema.ts                   — JSON schema for --json-schema constrained output
   prompts.ts                  — Security prompt, code quality prompt, user context builder
   trivial.ts                  — Trivial PR detection (docs/config/lock files)
@@ -130,7 +131,7 @@ Created root-level config files so `npm install && npm run build` works.
 - `.gitignore` — node_modules, .claude, vendor, dist (except dist/review.js)
 - `package.json` — devDeps: esbuild@0.24, typescript@5.7, @types/node@20. Scripts: `build` (esbuild bundle), `typecheck` (tsc --noEmit)
 - `tsconfig.json` — target ES2022, module ES2022, moduleResolution bundler, strict
-- `action.yml` — composite action with 17 inputs and 3 outputs. Three steps: setup-node@v4, install `@anthropic-ai/claude-code` globally, run `node dist/review.js`. Provider env vars (ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_BASE_URL, CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY) are mapped from inputs to env. All config flows to review.js as `INPUT_*` env vars.
+- `action.yml` — composite action with 17 inputs and 3 outputs. Three steps: setup-node@v4, install `@anthropic-ai/claude-code` globally, run `node dist/review.js`. Sets `PR_NUMBER` from `github.event.pull_request.number`. Provider env vars (ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_BASE_URL, CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY) are mapped from inputs to env. All config flows to review.js as `INPUT_*` env vars.
 - `src/types.ts` — `ReviewFinding`, `ReviewOutput`, `ClaudeJsonResult`, `ActionConfig` interfaces. **Severity uses `critical | warning | info`** (not Anthropic's HIGH/MEDIUM/LOW) because it aligns with GitHub review terminology and the verdict logic keys off these directly. `PassType` is `"security" | "code-quality"`. `ClaudeJsonResult` handles both `structured_output` (from --json-schema) and `result` string fallback.
 - `src/schema.ts` — JSON Schema object matching `ReviewOutput` structure, exported as both object (`reviewSchema`) and serialized string (`reviewSchemaJson`). Enforces `severity` enum, `confidence` 0-1 range, `additionalProperties: false` at all levels.
 - `src/review.ts` — stub entry point. Reads config from `INPUT_*` env vars via `getInput()` helper, parses `excludePatterns` (newline-split), `maxTurns`/`maxBudgetUsd` (number or undefined), booleans from string comparison. Logs config and exits. PR number extracted from `PR_NUMBER` env or `GITHUB_REF_NAME` pattern.
@@ -180,7 +181,9 @@ Invoke `claude` in full agentic mode with constrained JSON output.
 
 - `src/claude.ts` — Two exports:
   - `InvokeClaudeOptions` interface — `prompt`, `systemPrompt`, `repoDir`, `model`, optional `maxTurns`/`maxBudgetUsd`, `timeoutMinutes`, `disallowedTools` (default `"Bash(ps:*)"`).
-  - `invokeClaude(options): ReviewOutput` — builds CLI args array (`--output-format json --model {model} --json-schema {reviewSchemaJson} --append-system-prompt {systemPrompt} --disallowed-tools {disallowedTools}`), conditionally appends `--max-turns` and `--max-budget-usd` when defined. Executes via `execFileSync("claude", args, { input: prompt, cwd: repoDir, timeout: minutes→ms })`.
+  - `invokeClaude(options): InvokeResult` — returns `{ output: ReviewOutput, promptTooLong: boolean }`. Builds CLI args array (`--output-format json --model {model} --json-schema {reviewSchemaJson} --append-system-prompt {systemPrompt} --disallowed-tools {disallowedTools}`), conditionally appends `--max-turns` and `--max-budget-usd` when defined. Executes via `execFileSync("claude", args, { input: prompt, cwd: repoDir, timeout: minutes→ms })`.
+  - **Retry logic (3 attempts):** on non-timeout CLI failures, retries up to 3 times with linear backoff (5s, 10s, 15s). Timeouts are not retried (already at limit). Mirrors Anthropic's `SimpleClaudeRunner` retry pattern.
+  - **PROMPT_TOO_LONG detection:** checks Claude's JSON envelope for `is_error: true` + `"Prompt is too long"` in both stdout and error.stdout. Returns `promptTooLong: true` so the orchestrator can retry without diff.
   - JSON parsing: two-tier strategy via internal `parseClaudeOutput()` — prefers `structured_output` (constrained decoding), falls back to parsing `result` string, validates `findings` array exists.
   - Error handling: never throws. Returns empty `ReviewOutput` with `review_completed: false` on timeout, CLI failure, or parse failure. Logs human-readable error messages (timeout duration, exit code, stderr snippet).
   - Provider env vars (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_USE_BEDROCK`, etc.) flow through `process.env` automatically — zero provider-specific code.
@@ -193,34 +196,49 @@ Two dedicated prompts — the most important phase.
 - `src/prompts.ts` — three exports + internal helpers:
   - `buildSecurityPrompt(strictness, customInstructions)` — adapted from Anthropic's security prompt (`vendor/claude-code-security-review/claudecode/prompts.py`). Role: senior security engineer. Three-phase methodology: (1) Repository Context Research, (2) Comparative Analysis, (3) Vulnerability Assessment. Embeds 12-item EXCLUSIONS list mirroring `filter.ts` rules (dual-defense). Categories vary by strictness. Requires `exploit_scenario` for critical findings.
   - `buildCodeQualityPrompt(strictness, customInstructions)` — our own design (no Anthropic equivalent). Role: senior software engineer. Same three-phase structure adapted for quality. Explicit exclusions: security vulns (other pass), style, subjective preferences, test file issues (unless test is broken). Categories: null errors, logic errors, error handling, race conditions, resource management, API contracts; strict adds complexity, naming, test gaps.
-  - `buildUserContext(prData, diff, changedFiles)` — shared stdin for both passes. PR metadata + full file list + unified diff. `truncateDiff()` caps at 150k chars (~37k tokens), cuts at `diff --git` boundary, appends note directing Claude to use file tools for remaining files.
+  - `buildUserContext(prData, diff, changedFiles, includeDiff?)` — shared stdin for both passes. PR metadata + full file list + unified diff. `truncateDiff()` caps at 150k chars (~37k tokens), cuts at `diff --git` boundary, appends note directing Claude to use file tools for remaining files. When `includeDiff=false` (used on PROMPT_TOO_LONG retry), omits diff entirely and directs Claude to use file exploration tools.
   - Internal: `StrictnessConfig` maps `lenient|normal|strict` to `{confidenceFloor, reportInfoFindings, categoryScope}`. Lenient: 0.9/no/narrow. Normal: 0.8/no/standard. Strict: 0.7/yes/wide. Shared `SEVERITY_GUIDELINES` defines critical/warning/info in our terminology. `buildConfidenceGuidelines(floor)` generates scoring ranges with strictness-driven floor.
 
 **Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (1.4kb).
 
 ### Phase 6: Full Orchestration ✅
-Wire everything together in `src/review.ts` (~300 lines).
+Wire everything together in `src/review.ts` (~350 lines).
 
-- `src/review.ts` — complete orchestrator with 8 private helpers + `main()`:
+- `src/review.ts` — complete orchestrator with 10 private helpers + `main()`:
   - `globToRegex(pattern)` + `matchGlob(pattern, filepath)` — simple glob→regex for exclude patterns. Handles `*`, `**`, `?`. Tests basename if pattern has no `/`.
   - `filterExcludedFiles(files, patterns)` — filters `PRFile[]` by exclude patterns, logs exclusions.
-  - `filterDiffByFiles(diff, allowedFiles)` — splits unified diff on `diff --git` boundaries, keeps only allowed sections.
+  - `GENERATED_MARKERS` + `filterDiffByFiles(diff, allowedFiles)` — splits unified diff on `diff --git` boundaries, keeps only allowed sections. Also strips diff sections containing `@generated`, `AUTO-GENERATED`, `DO NOT EDIT`, or protobuf/OpenAPI generator markers (ported from Anthropic's `_filter_generated_files`).
   - `computeVerdict(findings)` — critical → `request_changes`, warning → `comment`, else → `approve`.
   - `formatFindingsSection(label, icon, findings)` — collapsible `<details>` block per severity group.
   - `buildSummaryComment(opts)` — full markdown summary: verdict icon, severity/pass matrix table, collapsible findings, incomplete-pass notes, filter count, auto-merge result, footer.
   - `setOutputs(values)` — appends `key=value` lines to `$GITHUB_OUTPUT`.
-  - `main()` flow: validate config → fetch PR data+diff → apply exclude patterns → trivial check → build user context → security pass → quality pass → merge+filter findings → compute verdict → post inline review → auto-merge if applicable → post summary → set outputs → exit 1 if failOnCritical.
+  - `runPass(passLabel, systemPrompt)` — helper that invokes Claude and handles PROMPT_TOO_LONG by retrying without diff.
+  - `main()` flow: validate config → **validate Claude CLI** → fetch PR data+diff → apply exclude patterns → trivial check → build user context → security pass (with PROMPT_TOO_LONG retry) → quality pass (with PROMPT_TOO_LONG retry) → merge+filter findings → compute verdict → post inline review → auto-merge if applicable → post summary → set outputs → exit 1 if failOnCritical.
   - Error handling: read ops fatal, Claude never throws, write ops best-effort (try/catch+warn).
 
-**Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (46.5kb), `node dist/review.js` exits gracefully with missing-env message.
+**Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (49.3kb), `node dist/review.js` exits gracefully with missing-env message.
 
 ### Phase 7: Build + README ✅
 Package for distribution.
 
-- `dist/review.js` — 46.5kb bundled via esbuild, checked into git.
+- `dist/review.js` — 49.3kb bundled via esbuild, checked into git.
 - `README.md` — ~260 lines covering: features, quick start, 6 provider setup examples (API key, OAuth, Bedrock, Vertex, Foundry, proxy), full inputs/outputs tables, strictness levels, exclude patterns, auto-merge docs, architecture overview, MIT license.
 
 **Verified:** `npm run build` succeeds, `npx tsc --noEmit` passes, `node dist/review.js` exits gracefully.
+
+### Phase 8: Operational Resilience ✅
+Compared against Anthropic's vendor examples and closed the gaps.
+
+- `action.yml` — added `PR_NUMBER: ${{ github.event.pull_request.number }}` to env block. No longer relies on fragile `GITHUB_REF_NAME` parsing.
+- `src/review.ts` — added Step 0: Claude CLI availability check (`claude --version`) before any work. Exits with clear install instructions if CLI is missing.
+- `src/review.ts` — `GENERATED_MARKERS` array + content-based generated file detection in `filterDiffByFiles()`. Strips diff sections containing `@generated`, `AUTO-GENERATED`, `DO NOT EDIT`, `Code generated by OpenAPI Generator`, `Code generated by protoc-gen-go`. Ported from Anthropic's `_filter_generated_files`.
+- `src/claude.ts` — retry logic: up to 3 attempts with linear backoff (5s, 10s, 15s). Timeouts are not retried. Mirrors Anthropic's `SimpleClaudeRunner` retry pattern.
+- `src/claude.ts` — PROMPT_TOO_LONG detection: `invokeClaude()` now returns `InvokeResult` with `{ output, promptTooLong }`. Detects Claude's `is_error: true` + `"Prompt is too long"` in both stdout and error paths.
+- `src/types.ts` — added `InvokeResult` interface.
+- `src/prompts.ts` — `buildUserContext()` gains optional `includeDiff` param (default `true`). When `false`, omits diff and directs Claude to use file exploration tools.
+- `src/review.ts` — `runPass()` helper wraps each Claude invocation: on `promptTooLong`, retries with `buildUserContext(prData, diff, changedFiles, false)`.
+
+**Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (49.3kb), `node dist/review.js` exits gracefully.
 
 ## Conventions
 

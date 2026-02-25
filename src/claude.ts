@@ -1,6 +1,6 @@
 import { execFileSync } from "child_process";
 import { reviewSchemaJson } from "./schema";
-import type { ReviewOutput, ClaudeJsonResult } from "./types";
+import type { ReviewOutput, ClaudeJsonResult, InvokeResult } from "./types";
 
 export interface InvokeClaudeOptions {
   prompt: string;
@@ -13,6 +13,9 @@ export interface InvokeClaudeOptions {
   disallowedTools?: string;
 }
 
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 5_000;
+
 const EMPTY_RESULT: ReviewOutput = {
   findings: [],
   analysis_summary: {
@@ -23,6 +26,25 @@ const EMPTY_RESULT: ReviewOutput = {
     review_completed: false,
   },
 };
+
+function sleep(ms: number): void {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { /* busy wait — no async in execFileSync context */ }
+}
+
+function isPromptTooLong(stdout: string): boolean {
+  try {
+    const envelope = JSON.parse(stdout);
+    return (
+      envelope?.type === "result" &&
+      envelope?.is_error === true &&
+      typeof envelope?.result === "string" &&
+      envelope.result.includes("Prompt is too long")
+    );
+  } catch {
+    return false;
+  }
+}
 
 function parseClaudeOutput(stdout: string): ReviewOutput {
   const envelope: ClaudeJsonResult = JSON.parse(stdout);
@@ -44,7 +66,7 @@ function parseClaudeOutput(stdout: string): ReviewOutput {
   return EMPTY_RESULT;
 }
 
-export function invokeClaude(options: InvokeClaudeOptions): ReviewOutput {
+export function invokeClaude(options: InvokeClaudeOptions): InvokeResult {
   const {
     prompt,
     systemPrompt,
@@ -73,27 +95,55 @@ export function invokeClaude(options: InvokeClaudeOptions): ReviewOutput {
 
   const timeoutMs = timeoutMinutes * 60 * 1_000;
 
-  try {
-    const stdout = execFileSync("claude", args, {
-      input: prompt,
-      cwd: repoDir,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: timeoutMs,
-    });
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const stdout = execFileSync("claude", args, {
+        input: prompt,
+        cwd: repoDir,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: timeoutMs,
+      });
 
-    return parseClaudeOutput(stdout);
-  } catch (err) {
-    const error = err as Error & { code?: string; stderr?: string; status?: number };
+      // Check for PROMPT_TOO_LONG before parsing — surface to caller
+      if (isPromptTooLong(stdout)) {
+        console.warn("Claude reported prompt is too long.");
+        return { output: EMPTY_RESULT, promptTooLong: true };
+      }
 
-    if (error.code === "ETIMEDOUT" || error.message?.includes("TIMEOUT")) {
-      console.error(`Claude CLI timed out after ${timeoutMinutes} minutes.`);
-    } else {
-      console.error(
-        `Claude CLI failed (exit ${error.status ?? "unknown"}): ${error.stderr?.slice(0, 500) || error.message}`,
+      return { output: parseClaudeOutput(stdout), promptTooLong: false };
+    } catch (err) {
+      const error = err as Error & { code?: string; stderr?: string; stdout?: string; status?: number };
+
+      // Check stdout on error too — Claude may return non-zero with PROMPT_TOO_LONG
+      if (error.stdout && isPromptTooLong(error.stdout)) {
+        console.warn("Claude reported prompt is too long.");
+        return { output: EMPTY_RESULT, promptTooLong: true };
+      }
+
+      const isTimeout = error.code === "ETIMEDOUT" || error.message?.includes("TIMEOUT");
+      const isLastAttempt = attempt === MAX_RETRIES - 1;
+
+      if (isTimeout) {
+        console.error(`Claude CLI timed out after ${timeoutMinutes} minutes.`);
+        return { output: EMPTY_RESULT, promptTooLong: false };
+      }
+
+      if (isLastAttempt) {
+        console.error(
+          `Claude CLI failed after ${MAX_RETRIES} attempts (exit ${error.status ?? "unknown"}): ${error.stderr?.slice(0, 500) || error.message}`,
+        );
+        return { output: EMPTY_RESULT, promptTooLong: false };
+      }
+
+      // Retry with backoff
+      const delayMs = RETRY_DELAY_MS * (attempt + 1);
+      console.warn(
+        `Claude CLI attempt ${attempt + 1} failed (exit ${error.status ?? "unknown"}), retrying in ${delayMs / 1000}s...`,
       );
+      sleep(delayMs);
     }
-
-    return EMPTY_RESULT;
   }
+
+  return { output: EMPTY_RESULT, promptTooLong: false };
 }

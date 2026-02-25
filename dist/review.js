@@ -25,6 +25,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 // src/review.ts
 var fs = __toESM(require("fs"));
 var path = __toESM(require("path"));
+var import_child_process3 = require("child_process");
 
 // src/github.ts
 var import_child_process = require("child_process");
@@ -332,6 +333,8 @@ var reviewSchema = {
 var reviewSchemaJson = JSON.stringify(reviewSchema);
 
 // src/claude.ts
+var MAX_RETRIES = 3;
+var RETRY_DELAY_MS = 5e3;
 var EMPTY_RESULT = {
   findings: [],
   analysis_summary: {
@@ -342,6 +345,19 @@ var EMPTY_RESULT = {
     review_completed: false
   }
 };
+function sleep(ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+  }
+}
+function isPromptTooLong(stdout) {
+  try {
+    const envelope = JSON.parse(stdout);
+    return envelope?.type === "result" && envelope?.is_error === true && typeof envelope?.result === "string" && envelope.result.includes("Prompt is too long");
+  } catch {
+    return false;
+  }
+}
 function parseClaudeOutput(stdout) {
   const envelope = JSON.parse(stdout);
   if (envelope.structured_output) {
@@ -386,26 +402,46 @@ function invokeClaude(options) {
     args.push("--max-budget-usd", String(maxBudgetUsd));
   }
   const timeoutMs = timeoutMinutes * 60 * 1e3;
-  try {
-    const stdout = (0, import_child_process2.execFileSync)("claude", args, {
-      input: prompt,
-      cwd: repoDir,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: timeoutMs
-    });
-    return parseClaudeOutput(stdout);
-  } catch (err) {
-    const error = err;
-    if (error.code === "ETIMEDOUT" || error.message?.includes("TIMEOUT")) {
-      console.error(`Claude CLI timed out after ${timeoutMinutes} minutes.`);
-    } else {
-      console.error(
-        `Claude CLI failed (exit ${error.status ?? "unknown"}): ${error.stderr?.slice(0, 500) || error.message}`
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const stdout = (0, import_child_process2.execFileSync)("claude", args, {
+        input: prompt,
+        cwd: repoDir,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: timeoutMs
+      });
+      if (isPromptTooLong(stdout)) {
+        console.warn("Claude reported prompt is too long.");
+        return { output: EMPTY_RESULT, promptTooLong: true };
+      }
+      return { output: parseClaudeOutput(stdout), promptTooLong: false };
+    } catch (err) {
+      const error = err;
+      if (error.stdout && isPromptTooLong(error.stdout)) {
+        console.warn("Claude reported prompt is too long.");
+        return { output: EMPTY_RESULT, promptTooLong: true };
+      }
+      const isTimeout = error.code === "ETIMEDOUT" || error.message?.includes("TIMEOUT");
+      const isLastAttempt = attempt === MAX_RETRIES - 1;
+      if (isTimeout) {
+        console.error(`Claude CLI timed out after ${timeoutMinutes} minutes.`);
+        return { output: EMPTY_RESULT, promptTooLong: false };
+      }
+      if (isLastAttempt) {
+        console.error(
+          `Claude CLI failed after ${MAX_RETRIES} attempts (exit ${error.status ?? "unknown"}): ${error.stderr?.slice(0, 500) || error.message}`
+        );
+        return { output: EMPTY_RESULT, promptTooLong: false };
+      }
+      const delayMs = RETRY_DELAY_MS * (attempt + 1);
+      console.warn(
+        `Claude CLI attempt ${attempt + 1} failed (exit ${error.status ?? "unknown"}), retrying in ${delayMs / 1e3}s...`
       );
+      sleep(delayMs);
     }
-    return EMPTY_RESULT;
   }
+  return { output: EMPTY_RESULT, promptTooLong: false };
 }
 
 // src/prompts.ts
@@ -722,10 +758,25 @@ Focus on bugs that will actually bite someone. A good code review catches the er
 
 Your final response must contain only the JSON output matching the required schema. Do not include any other text.${formatCustomInstructions(customInstructions)}`;
 }
-function buildUserContext(prData, diff, changedFiles) {
-  const { text: diffText, truncated } = truncateDiff(diff);
-  const truncationNote = truncated ? "\nNOTE: The diff was truncated due to size. Use file exploration tools (Read, Grep, Glob) to examine files not shown in the diff.\n" : "";
+function buildUserContext(prData, diff, changedFiles, includeDiff = true) {
   const filesList = changedFiles.map((f) => `- ${f}`).join("\n");
+  let diffSection;
+  if (includeDiff) {
+    const { text: diffText, truncated } = truncateDiff(diff);
+    const truncationNote = truncated ? "\nNOTE: The diff was truncated due to size. Use file exploration tools (Read, Grep, Glob) to examine files not shown in the diff.\n" : "";
+    diffSection = `${truncationNote}
+DIFF:
+\`\`\`
+${diffText}
+\`\`\`
+
+Review the PR diff above. Analyze the changes and produce your findings as structured JSON.`;
+  } else {
+    diffSection = `
+NOTE: PR diff was omitted due to size constraints. Please use the file exploration tools (Read, Grep, Glob) to examine the specific files that were changed in this PR.
+
+Analyze the changes and produce your findings as structured JSON.`;
+  }
   return `PULL REQUEST #${prData.number}: "${prData.title}"
 
 Author: ${prData.user}
@@ -739,13 +790,7 @@ ${prData.body || "(no description provided)"}
 
 Files changed:
 ${filesList}
-${truncationNote}
-DIFF:
-\`\`\`
-${diffText}
-\`\`\`
-
-Review the PR diff above. Analyze the changes and produce your findings as structured JSON.`;
+${diffSection}`;
 }
 
 // src/trivial.ts
@@ -1030,6 +1075,13 @@ function filterExcludedFiles(files, patterns) {
   }
   return kept;
 }
+var GENERATED_MARKERS = [
+  "@generated",
+  "Code generated by OpenAPI Generator",
+  "Code generated by protoc-gen-go",
+  "AUTO-GENERATED",
+  "DO NOT EDIT"
+];
 function filterDiffByFiles(diff, allowedFiles) {
   const sections = diff.split(/(?=^diff --git )/m);
   const kept = [];
@@ -1040,9 +1092,12 @@ function filterDiffByFiles(diff, allowedFiles) {
       continue;
     }
     const fileB = match[2];
-    if (allowedFiles.has(fileB)) {
-      kept.push(section);
+    if (!allowedFiles.has(fileB)) continue;
+    if (GENERATED_MARKERS.some((m) => section.includes(m))) {
+      console.log(`  [exclude] generated file in diff: ${fileB}`);
+      continue;
     }
+    kept.push(section);
   }
   return kept.join("");
 }
@@ -1168,6 +1223,12 @@ async function main() {
   if (config.autoMerge) {
     console.log(`  auto-merge: ${config.autoMergeMethod}`);
   }
+  try {
+    (0, import_child_process3.execFileSync)("claude", ["--version"], { encoding: "utf-8", timeout: 1e4, stdio: ["pipe", "pipe", "pipe"] });
+  } catch {
+    console.error("Claude Code CLI is not installed or not in PATH. Install with: npm install -g @anthropic-ai/claude-code");
+    process.exit(1);
+  }
   let prData;
   let diff;
   try {
@@ -1229,17 +1290,27 @@ async function main() {
   const changedFiles = files.map((f) => f.filename);
   const userContext = buildUserContext(prData, diff, changedFiles);
   const repoDir = process.env.GITHUB_WORKSPACE || process.cwd();
+  function runPass(passLabel, systemPrompt) {
+    const baseOpts = {
+      systemPrompt,
+      repoDir,
+      model: config.model,
+      maxTurns: config.maxTurns,
+      maxBudgetUsd: config.maxBudgetUsd,
+      timeoutMinutes: config.timeoutMinutes
+    };
+    let result = invokeClaude({ ...baseOpts, prompt: userContext });
+    if (result.promptTooLong) {
+      console.warn(`  ${passLabel}: prompt too long, retrying without diff...`);
+      const smallerContext = buildUserContext(prData, diff, changedFiles, false);
+      result = invokeClaude({ ...baseOpts, prompt: smallerContext });
+    }
+    return result;
+  }
   console.log("\n--- Pass 1: Security Review ---");
   const securityPrompt = buildSecurityPrompt(config.strictness, config.customInstructions);
-  const securityResult = invokeClaude({
-    prompt: userContext,
-    systemPrompt: securityPrompt,
-    repoDir,
-    model: config.model,
-    maxTurns: config.maxTurns,
-    maxBudgetUsd: config.maxBudgetUsd,
-    timeoutMinutes: config.timeoutMinutes
-  });
+  const securityInvoke = runPass("Security", securityPrompt);
+  const securityResult = securityInvoke.output;
   const securityCompleted = securityResult.analysis_summary.review_completed;
   console.log(`  completed: ${securityCompleted}, findings: ${securityResult.findings.length}`);
   for (const f of securityResult.findings) {
@@ -1247,15 +1318,8 @@ async function main() {
   }
   console.log("\n--- Pass 2: Code Quality Review ---");
   const qualityPrompt = buildCodeQualityPrompt(config.strictness, config.customInstructions);
-  const qualityResult = invokeClaude({
-    prompt: userContext,
-    systemPrompt: qualityPrompt,
-    repoDir,
-    model: config.model,
-    maxTurns: config.maxTurns,
-    maxBudgetUsd: config.maxBudgetUsd,
-    timeoutMinutes: config.timeoutMinutes
-  });
+  const qualityInvoke = runPass("Code Quality", qualityPrompt);
+  const qualityResult = qualityInvoke.output;
   const qualityCompleted = qualityResult.analysis_summary.review_completed;
   console.log(`  completed: ${qualityCompleted}, findings: ${qualityResult.findings.length}`);
   for (const f of qualityResult.findings) {

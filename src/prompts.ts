@@ -352,14 +352,28 @@ Your final response must contain only the JSON output matching the required sche
 
 // ─── User context (stdin for both passes) ────────────────────────────
 
-export function buildUserContext(prData: PRData, diff: string, changedFiles: string[]): string {
-  const { text: diffText, truncated } = truncateDiff(diff);
-
-  const truncationNote = truncated
-    ? "\nNOTE: The diff was truncated due to size. Use file exploration tools (Read, Grep, Glob) to examine files not shown in the diff.\n"
-    : "";
-
+export function buildUserContext(prData: PRData, diff: string, changedFiles: string[], includeDiff = true): string {
   const filesList = changedFiles.map((f) => `- ${f}`).join("\n");
+
+  let diffSection: string;
+  if (includeDiff) {
+    const { text: diffText, truncated } = truncateDiff(diff);
+    const truncationNote = truncated
+      ? "\nNOTE: The diff was truncated due to size. Use file exploration tools (Read, Grep, Glob) to examine files not shown in the diff.\n"
+      : "";
+    diffSection = `${truncationNote}
+DIFF:
+\`\`\`
+${diffText}
+\`\`\`
+
+Review the PR diff above. Analyze the changes and produce your findings as structured JSON.`;
+  } else {
+    diffSection = `
+NOTE: PR diff was omitted due to size constraints. Please use the file exploration tools (Read, Grep, Glob) to examine the specific files that were changed in this PR.
+
+Analyze the changes and produce your findings as structured JSON.`;
+  }
 
   return `PULL REQUEST #${prData.number}: "${prData.title}"
 
@@ -374,11 +388,5 @@ ${prData.body || "(no description provided)"}
 
 Files changed:
 ${filesList}
-${truncationNote}
-DIFF:
-\`\`\`
-${diffText}
-\`\`\`
-
-Review the PR diff above. Analyze the changes and produce your findings as structured JSON.`;
+${diffSection}`;
 }

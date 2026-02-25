@@ -64,6 +64,11 @@ export interface MergeResult {
   sha?: string;
 }
 
+export interface InvokeResult {
+  output: ReviewOutput;
+  promptTooLong: boolean;
+}
+
 export interface ActionConfig {
   repo: string;
   prNumber: number;
