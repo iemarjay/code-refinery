@@ -187,17 +187,16 @@ Invoke `claude` in full agentic mode with constrained JSON output.
 
 **Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (1.4kb).
 
-### Phase 5: Prompts (Security + Code Quality) ⬜
+### Phase 5: Prompts (Security + Code Quality) ✅
 Two dedicated prompts — the most important phase.
 
-- `src/prompts.ts`:
-  - `buildSecurityPrompt(strictness, customInstructions)` — adapted from:
-    - `vendor/claude-code-security-review/claudecode/prompts.py` (Anthropic's security prompt)
-    - Anthropic's false positive filter categories (what NOT to flag)
-  - `buildCodeQualityPrompt(strictness, customInstructions)` — categories: null errors, race conditions, resource leaks, error handling, logic errors, complexity, naming, test gaps
-  - `buildUserContext(prData, diff, changedFiles)` — shared PR context used as stdin for both passes
+- `src/prompts.ts` — three exports + internal helpers:
+  - `buildSecurityPrompt(strictness, customInstructions)` — adapted from Anthropic's security prompt (`vendor/claude-code-security-review/claudecode/prompts.py`). Role: senior security engineer. Three-phase methodology: (1) Repository Context Research, (2) Comparative Analysis, (3) Vulnerability Assessment. Embeds 12-item EXCLUSIONS list mirroring `filter.ts` rules (dual-defense). Categories vary by strictness. Requires `exploit_scenario` for critical findings.
+  - `buildCodeQualityPrompt(strictness, customInstructions)` — our own design (no Anthropic equivalent). Role: senior software engineer. Same three-phase structure adapted for quality. Explicit exclusions: security vulns (other pass), style, subjective preferences, test file issues (unless test is broken). Categories: null errors, logic errors, error handling, race conditions, resource management, API contracts; strict adds complexity, naming, test gaps.
+  - `buildUserContext(prData, diff, changedFiles)` — shared stdin for both passes. PR metadata + full file list + unified diff. `truncateDiff()` caps at 150k chars (~37k tokens), cuts at `diff --git` boundary, appends note directing Claude to use file tools for remaining files.
+  - Internal: `StrictnessConfig` maps `lenient|normal|strict` to `{confidenceFloor, reportInfoFindings, categoryScope}`. Lenient: 0.9/no/narrow. Normal: 0.8/no/standard. Strict: 0.7/yes/wide. Shared `SEVERITY_GUIDELINES` defines critical/warning/info in our terminology. `buildConfidenceGuidelines(floor)` generates scoring ranges with strictness-driven floor.
 
-**Verify:** Build prompts with different strictness levels, inspect output. Security prompt should NOT mention style. Quality prompt should NOT mention injection.
+**Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (1.4kb).
 
 ### Phase 6: Full Orchestration ⬜
 Wire everything together.
