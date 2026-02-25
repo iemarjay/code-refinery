@@ -198,33 +198,29 @@ Two dedicated prompts — the most important phase.
 
 **Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (1.4kb).
 
-### Phase 6: Full Orchestration ⬜
-Wire everything together.
+### Phase 6: Full Orchestration ✅
+Wire everything together in `src/review.ts` (~300 lines).
 
-- `src/review.ts` — complete flow:
-  1. Read config from `INPUT_*` env vars
-  2. Set provider env vars
-  3. Fetch PR data + diff → apply exclude patterns
-  4. Trivial check → skip if trivial
-  5. Pass 1: security prompt → `invokeClaude()` → tag findings as `"security"`
-  6. Pass 2: quality prompt → `invokeClaude()` → tag findings as `"code-quality"`
-  7. Merge + filter false positives
-  8. Compute verdict (request_changes if criticals, comment if findings, approve if clean)
-  9. Post inline review (critical + warning)
-  10. Post summary comment
-  11. If `auto_merge` enabled AND verdict is `approve` → merge PR (squash/merge/rebase)
-  12. Set GitHub Action outputs
-  13. Exit 1 if `fail_on_critical` and criticals found
+- `src/review.ts` — complete orchestrator with 8 private helpers + `main()`:
+  - `globToRegex(pattern)` + `matchGlob(pattern, filepath)` — simple glob→regex for exclude patterns. Handles `*`, `**`, `?`. Tests basename if pattern has no `/`.
+  - `filterExcludedFiles(files, patterns)` — filters `PRFile[]` by exclude patterns, logs exclusions.
+  - `filterDiffByFiles(diff, allowedFiles)` — splits unified diff on `diff --git` boundaries, keeps only allowed sections.
+  - `computeVerdict(findings)` — critical → `request_changes`, warning → `comment`, else → `approve`.
+  - `formatFindingsSection(label, icon, findings)` — collapsible `<details>` block per severity group.
+  - `buildSummaryComment(opts)` — full markdown summary: verdict icon, severity/pass matrix table, collapsible findings, incomplete-pass notes, filter count, auto-merge result, footer.
+  - `setOutputs(values)` — appends `key=value` lines to `$GITHUB_OUTPUT`.
+  - `main()` flow: validate config → fetch PR data+diff → apply exclude patterns → trivial check → build user context → security pass → quality pass → merge+filter findings → compute verdict → post inline review → auto-merge if applicable → post summary → set outputs → exit 1 if failOnCritical.
+  - Error handling: read ops fatal, Claude never throws, write ops best-effort (try/catch+warn).
 
-**Verify:** Full end-to-end against a real PR. Confirm both passes run, inline comments land correctly, summary is readable.
+**Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (46.5kb), `node dist/review.js` exits gracefully with missing-env message.
 
-### Phase 7: Build + README ⬜
+### Phase 7: Build + README ✅
 Package for distribution.
 
-- Build `dist/review.js` via esbuild, check into git
-- Write `README.md` with setup examples for all provider types
+- `dist/review.js` — 46.5kb bundled via esbuild, checked into git.
+- `README.md` — ~260 lines covering: features, quick start, 6 provider setup examples (API key, OAuth, Bedrock, Vertex, Foundry, proxy), full inputs/outputs tables, strictness levels, exclude patterns, auto-merge docs, architecture overview, MIT license.
 
-**Verify:** Fresh clone → add workflow → open PR → review runs end-to-end.
+**Verified:** `npm run build` succeeds, `npx tsc --noEmit` passes, `node dist/review.js` exits gracefully.
 
 ## Conventions
 

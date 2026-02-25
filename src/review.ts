@@ -1,4 +1,15 @@
-import type { ActionConfig } from "./types";
+import * as fs from "fs";
+import * as path from "path";
+import type { ActionConfig, PRFile, ReviewFinding, Verdict, MergeResult, ReviewOutput } from "./types";
+import { getPRData, getPRDiff, postSummaryComment, postInlineReview, mergePR } from "./github";
+import { invokeClaude } from "./claude";
+import { buildSecurityPrompt, buildCodeQualityPrompt, buildUserContext } from "./prompts";
+import { isTrivialPR } from "./trivial";
+import { filterFindings } from "./filter";
+
+// ---------------------------------------------------------------------------
+// Config helpers (unchanged)
+// ---------------------------------------------------------------------------
 
 function getInput(name: string, fallback = ""): string {
   return process.env[`INPUT_${name.toUpperCase()}`] ?? fallback;
@@ -24,21 +35,432 @@ function readConfig(): ActionConfig {
   };
 }
 
-function main(): void {
+// ---------------------------------------------------------------------------
+// Glob matching for exclude patterns
+// ---------------------------------------------------------------------------
+
+function globToRegex(pattern: string): RegExp {
+  let re = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&") // escape regex metacharacters (except * and ?)
+    .replace(/\*\*/g, "\0DOUBLESTAR\0")     // placeholder for **
+    .replace(/\*/g, "[^/]*")                // * matches within a single path segment
+    .replace(/\0DOUBLESTAR\0/g, ".*")       // ** matches across segments
+    .replace(/\?/g, "[^/]");                // ? matches single non-slash char
+
+  return new RegExp(`^${re}$`);
+}
+
+function matchGlob(pattern: string, filepath: string): boolean {
+  const re = globToRegex(pattern);
+  if (re.test(filepath)) return true;
+
+  // If pattern has no slash, also test against the basename
+  if (!pattern.includes("/")) {
+    const basename = path.posix.basename(filepath);
+    if (re.test(basename)) return true;
+  }
+
+  return false;
+}
+
+function filterExcludedFiles(files: PRFile[], patterns: string[]): PRFile[] {
+  if (patterns.length === 0) return files;
+
+  const kept: PRFile[] = [];
+  for (const file of files) {
+    const excluded = patterns.some((p) => matchGlob(p, file.filename));
+    if (excluded) {
+      console.log(`  [exclude] ${file.filename}`);
+    } else {
+      kept.push(file);
+    }
+  }
+
+  if (kept.length < files.length) {
+    console.log(`  [exclude] ${files.length - kept.length} file(s) excluded, ${kept.length} remaining`);
+  }
+
+  return kept;
+}
+
+function filterDiffByFiles(diff: string, allowedFiles: Set<string>): string {
+  // Split on diff boundaries, keeping the delimiter
+  const sections = diff.split(/(?=^diff --git )/m);
+
+  const kept: string[] = [];
+  for (const section of sections) {
+    // Extract the filename from "diff --git a/path b/path"
+    const match = section.match(/^diff --git a\/(.+?) b\/(.+)/);
+    if (!match) {
+      // Preamble or non-matching section — keep it
+      if (section.trim()) kept.push(section);
+      continue;
+    }
+
+    const fileB = match[2];
+    if (allowedFiles.has(fileB)) {
+      kept.push(section);
+    }
+  }
+
+  return kept.join("");
+}
+
+// ---------------------------------------------------------------------------
+// Verdict computation
+// ---------------------------------------------------------------------------
+
+function computeVerdict(findings: ReviewFinding[]): Verdict {
+  if (findings.some((f) => f.severity === "critical")) return "request_changes";
+  if (findings.some((f) => f.severity === "warning")) return "comment";
+  return "approve";
+}
+
+// ---------------------------------------------------------------------------
+// Summary comment builder
+// ---------------------------------------------------------------------------
+
+function formatFindingsSection(label: string, icon: string, findings: ReviewFinding[]): string {
+  if (findings.length === 0) return "";
+
+  const lines: string[] = [];
+  lines.push(`<details>`);
+  lines.push(`<summary>${icon} ${label} (${findings.length})</summary>`);
+  lines.push("");
+
+  for (const f of findings) {
+    const passLabel = f.pass_type === "security" ? "Security" : "Code Quality";
+    lines.push(`#### \`${f.file}:${f.line}\` — ${f.category}`);
+    lines.push("");
+    lines.push(`| | |`);
+    lines.push(`|---|---|`);
+    lines.push(`| **Severity** | ${f.severity} |`);
+    lines.push(`| **Pass** | ${passLabel} |`);
+    lines.push(`| **Confidence** | ${f.confidence} |`);
+    lines.push("");
+    lines.push(f.description);
+    lines.push("");
+    if (f.recommendation) {
+      lines.push(`**Recommendation:** ${f.recommendation}`);
+      lines.push("");
+    }
+    if (f.exploit_scenario) {
+      lines.push(`**Exploit scenario:** ${f.exploit_scenario}`);
+      lines.push("");
+    }
+    lines.push("---");
+    lines.push("");
+  }
+
+  lines.push(`</details>`);
+  lines.push("");
+  return lines.join("\n");
+}
+
+interface SummaryOptions {
+  verdict: Verdict;
+  findings: ReviewFinding[];
+  securityCompleted: boolean;
+  qualityCompleted: boolean;
+  filteredCount: number;
+  mergeResult?: MergeResult;
+  trivial?: boolean;
+}
+
+function buildSummaryComment(opts: SummaryOptions): string {
+  const { verdict, findings, securityCompleted, qualityCompleted, filteredCount, mergeResult, trivial } = opts;
+
+  const lines: string[] = [];
+
+  // Verdict header
+  if (trivial) {
+    lines.push("## Code Refinery Review — Skipped (Trivial PR)");
+    lines.push("");
+    lines.push("This PR contains only documentation, configuration, or lockfile changes. No security or code quality review was performed.");
+    lines.push("");
+    lines.push(`<sub>Reviewed by Code Refinery</sub>`);
+    return lines.join("\n");
+  }
+
+  const verdictIcon = verdict === "approve" ? "Approved" : verdict === "comment" ? "Comments" : "Changes Requested";
+  const verdictEmoji = verdict === "approve" ? "\u2705" : verdict === "comment" ? "\u26a0\ufe0f" : "\u274c";
+  lines.push(`## ${verdictEmoji} Code Refinery Review — ${verdictIcon}`);
+  lines.push("");
+
+  // Severity / pass matrix table
+  const secFindings = findings.filter((f) => f.pass_type === "security");
+  const qualFindings = findings.filter((f) => f.pass_type === "code-quality");
+
+  const count = (arr: ReviewFinding[], sev: string) => arr.filter((f) => f.severity === sev).length;
+
+  lines.push("| | Critical | Warning | Info |");
+  lines.push("|---|:---:|:---:|:---:|");
+  lines.push(`| Security | ${count(secFindings, "critical")} | ${count(secFindings, "warning")} | ${count(secFindings, "info")} |`);
+  lines.push(`| Code Quality | ${count(qualFindings, "critical")} | ${count(qualFindings, "warning")} | ${count(qualFindings, "info")} |`);
+  lines.push("");
+
+  // Findings sections by severity
+  const criticals = findings.filter((f) => f.severity === "critical");
+  const warnings = findings.filter((f) => f.severity === "warning");
+  const infos = findings.filter((f) => f.severity === "info");
+
+  lines.push(formatFindingsSection("Critical", "\ud83d\udd34", criticals));
+  lines.push(formatFindingsSection("Warning", "\ud83d\udfe1", warnings));
+  lines.push(formatFindingsSection("Info", "\ud83d\udfe2", infos));
+
+  // Incomplete pass notes
+  if (!securityCompleted || !qualityCompleted) {
+    const incomplete: string[] = [];
+    if (!securityCompleted) incomplete.push("Security");
+    if (!qualityCompleted) incomplete.push("Code Quality");
+    lines.push(`> **Note:** The following review pass(es) did not complete successfully: ${incomplete.join(", ")}. Results may be incomplete.`);
+    lines.push("");
+  }
+
+  // Filtered count
+  if (filteredCount > 0) {
+    lines.push(`<sub>${filteredCount} finding(s) were filtered as likely false positives.</sub>`);
+    lines.push("");
+  }
+
+  // Auto-merge result
+  if (mergeResult) {
+    if (mergeResult.merged) {
+      lines.push(`**Auto-merged** (sha: \`${mergeResult.sha}\`): ${mergeResult.message}`);
+    } else {
+      lines.push(`**Auto-merge attempted but failed:** ${mergeResult.message}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(`<sub>Reviewed by Code Refinery</sub>`);
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// GitHub Action outputs
+// ---------------------------------------------------------------------------
+
+function setOutputs(values: Record<string, string>): void {
+  const outputFile = process.env.GITHUB_OUTPUT;
+  if (!outputFile) {
+    console.log("GITHUB_OUTPUT not set — printing outputs to console:");
+    for (const [k, v] of Object.entries(values)) {
+      console.log(`  ${k}=${v}`);
+    }
+    return;
+  }
+
+  const lines = Object.entries(values)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
+
+  fs.appendFileSync(outputFile, lines + "\n", "utf-8");
+}
+
+// ---------------------------------------------------------------------------
+// Main orchestrator
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
   const config = readConfig();
+
+  // Validate required config
+  if (!config.repo) {
+    console.error("GITHUB_REPOSITORY is not set. Cannot determine repository.");
+    process.exit(1);
+  }
+  if (!config.prNumber || config.prNumber === 0) {
+    console.error("PR number could not be determined from PR_NUMBER or GITHUB_REF_NAME.");
+    process.exit(1);
+  }
 
   console.log("Code Refinery — PR Review");
   console.log(`  repo:       ${config.repo}`);
   console.log(`  pr:         #${config.prNumber}`);
   console.log(`  model:      ${config.model}`);
   console.log(`  strictness: ${config.strictness}`);
-
   if (config.excludePatterns.length > 0) {
     console.log(`  exclude:    ${config.excludePatterns.join(", ")}`);
   }
+  if (config.autoMerge) {
+    console.log(`  auto-merge: ${config.autoMergeMethod}`);
+  }
 
-  // Phase 1 stub — review not yet implemented
-  console.log("\nPhase 1 stub — review not yet implemented.");
+  // ── Step 1: Fetch PR data and diff ────────────────────────────────────
+  let prData;
+  let diff: string;
+  try {
+    console.log("\nFetching PR data...");
+    prData = getPRData(config.repo, config.prNumber);
+    console.log(`  title: "${prData.title}" by ${prData.user}`);
+    console.log(`  ${prData.changedFiles} files, +${prData.additions} -${prData.deletions}`);
+
+    diff = getPRDiff(config.repo, config.prNumber);
+    console.log(`  diff size: ${diff.length} chars`);
+  } catch (err) {
+    console.error(`Failed to fetch PR data: ${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  // ── Step 2: Apply exclude patterns ────────────────────────────────────
+  let files = prData.files;
+  if (config.excludePatterns.length > 0) {
+    console.log("\nApplying exclude patterns...");
+    files = filterExcludedFiles(files, config.excludePatterns);
+    prData = { ...prData, files };
+
+    const allowedSet = new Set(files.map((f) => f.filename));
+    diff = filterDiffByFiles(diff, allowedSet);
+  }
+
+  if (files.length === 0) {
+    console.log("\nAll files excluded by patterns. Nothing to review.");
+    const summary = buildSummaryComment({
+      verdict: "approve",
+      findings: [],
+      securityCompleted: true,
+      qualityCompleted: true,
+      filteredCount: 0,
+      trivial: true,
+    });
+    try { postSummaryComment(config.repo, config.prNumber, summary); } catch (err) {
+      console.warn(`Failed to post summary: ${(err as Error).message}`);
+    }
+    setOutputs({ findings_count: "0", critical_count: "0", verdict: "approve" });
+    return;
+  }
+
+  // ── Step 3: Trivial PR check ──────────────────────────────────────────
+  console.log("\nChecking if PR is trivial...");
+  if (isTrivialPR(files)) {
+    console.log("PR is trivial — skipping review.");
+    const summary = buildSummaryComment({
+      verdict: "approve",
+      findings: [],
+      securityCompleted: true,
+      qualityCompleted: true,
+      filteredCount: 0,
+      trivial: true,
+    });
+    try { postSummaryComment(config.repo, config.prNumber, summary); } catch (err) {
+      console.warn(`Failed to post summary: ${(err as Error).message}`);
+    }
+    setOutputs({ findings_count: "0", critical_count: "0", verdict: "approve" });
+    return;
+  }
+
+  // ── Step 4: Build user context ────────────────────────────────────────
+  const changedFiles = files.map((f) => f.filename);
+  const userContext = buildUserContext(prData, diff, changedFiles);
+  const repoDir = process.env.GITHUB_WORKSPACE || process.cwd();
+
+  // ── Step 5: Security pass ─────────────────────────────────────────────
+  console.log("\n--- Pass 1: Security Review ---");
+  const securityPrompt = buildSecurityPrompt(config.strictness, config.customInstructions);
+  const securityResult: ReviewOutput = invokeClaude({
+    prompt: userContext,
+    systemPrompt: securityPrompt,
+    repoDir,
+    model: config.model,
+    maxTurns: config.maxTurns,
+    maxBudgetUsd: config.maxBudgetUsd,
+    timeoutMinutes: config.timeoutMinutes,
+  });
+  const securityCompleted = securityResult.analysis_summary.review_completed;
+  console.log(`  completed: ${securityCompleted}, findings: ${securityResult.findings.length}`);
+
+  // Tag security findings
+  for (const f of securityResult.findings) {
+    f.pass_type = "security";
+  }
+
+  // ── Step 6: Code quality pass ─────────────────────────────────────────
+  console.log("\n--- Pass 2: Code Quality Review ---");
+  const qualityPrompt = buildCodeQualityPrompt(config.strictness, config.customInstructions);
+  const qualityResult: ReviewOutput = invokeClaude({
+    prompt: userContext,
+    systemPrompt: qualityPrompt,
+    repoDir,
+    model: config.model,
+    maxTurns: config.maxTurns,
+    maxBudgetUsd: config.maxBudgetUsd,
+    timeoutMinutes: config.timeoutMinutes,
+  });
+  const qualityCompleted = qualityResult.analysis_summary.review_completed;
+  console.log(`  completed: ${qualityCompleted}, findings: ${qualityResult.findings.length}`);
+
+  // Tag quality findings
+  for (const f of qualityResult.findings) {
+    f.pass_type = "code-quality";
+  }
+
+  // ── Step 7: Merge + filter findings ───────────────────────────────────
+  const allFindings = [...securityResult.findings, ...qualityResult.findings];
+  console.log(`\nTotal raw findings: ${allFindings.length}`);
+
+  console.log("Applying false-positive filters...");
+  const filtered = filterFindings(allFindings);
+  const filteredCount = allFindings.length - filtered.length;
+
+  const criticalCount = filtered.filter((f) => f.severity === "critical").length;
+  const warningCount = filtered.filter((f) => f.severity === "warning").length;
+  const infoCount = filtered.filter((f) => f.severity === "info").length;
+  console.log(`  after filtering: ${filtered.length} (${criticalCount} critical, ${warningCount} warning, ${infoCount} info)`);
+
+  // ── Step 8: Compute verdict ───────────────────────────────────────────
+  const verdict = computeVerdict(filtered);
+  console.log(`\nVerdict: ${verdict}`);
+
+  // ── Step 9: Post inline review comments ───────────────────────────────
+  try {
+    postInlineReview(config.repo, config.prNumber, prData.headSha, filtered, files);
+  } catch (err) {
+    console.warn(`Failed to post inline review: ${(err as Error).message}`);
+  }
+
+  // ── Step 10: Auto-merge if applicable ─────────────────────────────────
+  let mergeResult: MergeResult | undefined;
+  if (config.autoMerge && verdict === "approve") {
+    console.log(`\nAuto-merging PR (method: ${config.autoMergeMethod})...`);
+    mergeResult = mergePR(config.repo, config.prNumber, config.autoMergeMethod);
+    if (mergeResult.merged) {
+      console.log(`  Merged successfully (sha: ${mergeResult.sha}).`);
+    } else {
+      console.log(`  Merge failed: ${mergeResult.message}`);
+    }
+  }
+
+  // ── Step 11: Post summary comment ─────────────────────────────────────
+  const summary = buildSummaryComment({
+    verdict,
+    findings: filtered,
+    securityCompleted,
+    qualityCompleted,
+    filteredCount,
+    mergeResult,
+  });
+
+  try {
+    postSummaryComment(config.repo, config.prNumber, summary);
+  } catch (err) {
+    console.warn(`Failed to post summary comment: ${(err as Error).message}`);
+  }
+
+  // ── Step 12: Set outputs ──────────────────────────────────────────────
+  setOutputs({
+    findings_count: String(filtered.length),
+    critical_count: String(criticalCount),
+    verdict,
+  });
+
+  // ── Step 13: Fail on critical if configured ───────────────────────────
+  if (config.failOnCritical && criticalCount > 0) {
+    console.error(`\nFailing: ${criticalCount} critical finding(s) detected and fail_on_critical is enabled.`);
+    process.exit(1);
+  }
+
+  console.log("\nReview complete.");
 }
 
 main();
