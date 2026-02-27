@@ -12,6 +12,7 @@ Automated PR review for GitHub -- two dedicated passes (security + code quality)
 - **Trivial PR detection** -- skips docs-only, config-only, and lockfile-only PRs automatically
 - **False positive filtering** -- hard regex rules eliminate common noise (lockfiles, vendored code, low-confidence findings)
 - **Inline comments** -- critical and warning findings posted directly on the relevant diff lines
+- **Branded bot identity** -- comments appear as **code-refinery [bot]** via automatic OIDC token exchange (zero config)
 - **Zero runtime dependencies** -- uses `gh` CLI (pre-installed on runners) for all GitHub API calls
 
 ## Quick Start
@@ -26,13 +27,14 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  id-token: write
 
 jobs:
   review:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: your-org/code-refinery@v1
+      - uses: iemarjay/code-refinery@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
@@ -44,42 +46,42 @@ Copy the prompt for your provider into Claude Code, Cursor, or any AI coding ass
 <details>
 <summary><b>Anthropic API Key</b></summary>
 
-> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write` and `pull-requests: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed.
+> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write`, `pull-requests: write`, and `id-token: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed.
 
 </details>
 
 <details>
 <summary><b>Claude Pro/Max (OAuth) -- flat rate, no per-token cost</b></summary>
 
-> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write` and `pull-requests: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed.
+> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write`, `pull-requests: write`, and `id-token: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed.
 
 </details>
 
 <details>
 <summary><b>AWS Bedrock</b></summary>
 
-> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write` and `pull-requests: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `use_bedrock: true`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed. Also add these env vars to the action step: `AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}`, `AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}`, `AWS_REGION: us-east-1`.
+> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write`, `pull-requests: write`, and `id-token: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `use_bedrock: true`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed. Also add these env vars to the action step: `AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}`, `AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}`, `AWS_REGION: us-east-1`.
 
 </details>
 
 <details>
 <summary><b>Google Vertex AI</b></summary>
 
-> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write` and `pull-requests: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `use_vertex: true`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed. Also add these env vars to the action step: `CLOUD_ML_REGION: us-east5`, `ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}`, `GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS_PATH }}`.
+> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write`, `pull-requests: write`, and `id-token: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `use_vertex: true`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed. Also add these env vars to the action step: `CLOUD_ML_REGION: us-east5`, `ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}`, `GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS_PATH }}`.
 
 </details>
 
 <details>
 <summary><b>Azure Foundry</b></summary>
 
-> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write` and `pull-requests: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `use_foundry: true`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed. Also add this env var to the action step: `AZURE_ACCESS_TOKEN: ${{ secrets.AZURE_ACCESS_TOKEN }}`.
+> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write`, `pull-requests: write`, and `id-token: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `use_foundry: true`, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed. Also add this env var to the action step: `AZURE_ACCESS_TOKEN: ${{ secrets.AZURE_ACCESS_TOKEN }}`.
 
 </details>
 
 <details>
 <summary><b>Cloudflare Workers AI / Custom Proxy</b></summary>
 
-> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write` and `pull-requests: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`, `anthropic_base_url` pointing to your Cloudflare Workers AI gateway / LiteLLM / OpenRouter endpoint, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed.
+> Add a GitHub Actions PR review pipeline using iemarjay/code-refinery@v1. Create `.github/workflows/code-refinery.yml` with: trigger on `pull_request` (opened, synchronize, reopened), permissions `contents: write`, `pull-requests: write`, and `id-token: write`, concurrency group keyed on PR number with `cancel-in-progress: true`, single job `review` on `ubuntu-latest` with two steps: `actions/checkout@v4` then `iemarjay/code-refinery@v1`. For the action inputs, read the codebase first to understand the project (tech stack, sensitive areas, generated/vendored files) then set: `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`, `anthropic_base_url` pointing to your Cloudflare Workers AI gateway / LiteLLM / OpenRouter endpoint, `auto_merge: true`, `auto_merge_method: squash`, `fail_on_critical: true`, `strictness: strict`, `custom_instructions` with 2-4 sentences specific to this codebase about what to pay extra attention to based on what you found, and `exclude_patterns` listing any generated files, vendored code, or asset directories that shouldn't be reviewed.
 
 </details>
 
@@ -92,7 +94,7 @@ Code Refinery works with any Claude provider via environment variables. All prov
 The simplest setup. Create an API key at [console.anthropic.com](https://console.anthropic.com).
 
 ```yaml
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
@@ -105,7 +107,7 @@ For subscribers on Claude Pro or Max plans. Flat monthly rate with no per-token 
 2. Store it as a repository secret.
 
 ```yaml
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 ```
@@ -113,7 +115,7 @@ For subscribers on Claude Pro or Max plans. Flat monthly rate with no per-token 
 ### AWS Bedrock
 
 ```yaml
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     use_bedrock: true
   env:
@@ -125,7 +127,7 @@ For subscribers on Claude Pro or Max plans. Flat monthly rate with no per-token 
 ### Google Vertex AI
 
 ```yaml
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     use_vertex: true
   env:
@@ -137,7 +139,7 @@ For subscribers on Claude Pro or Max plans. Flat monthly rate with no per-token 
 ### Azure Foundry
 
 ```yaml
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     use_foundry: true
   env:
@@ -150,17 +152,23 @@ Point `anthropic_base_url` at any API-compatible proxy.
 
 ```yaml
 # Cloudflare AI Gateway
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
     anthropic_base_url: https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/anthropic
 
 # LiteLLM / OpenRouter
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     anthropic_api_key: ${{ secrets.PROXY_API_KEY }}
     anthropic_base_url: https://your-proxy.example.com
 ```
+
+## Branded Bot Identity
+
+Review comments are posted as **code-refinery [bot]** via automatic OIDC token exchange -- no secrets or configuration needed. The action requests a GitHub Actions OIDC token (built-in), exchanges it for a GitHub App installation token, and uses that for all API calls.
+
+Just ensure your workflow has `id-token: write` permission (included in the Quick Start example above). If OIDC exchange fails for any reason, the action falls back to `GITHUB_TOKEN` gracefully and comments appear as "github-actions [bot]" instead.
 
 ## Inputs
 
@@ -203,7 +211,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: refinery
-        uses: your-org/code-refinery@v1
+        uses: iemarjay/code-refinery@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 
@@ -232,7 +240,7 @@ jobs:
 Skip files from review using newline-separated glob patterns:
 
 ```yaml
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
     exclude_patterns: |
@@ -249,7 +257,7 @@ Excluded files are removed from the diff before Claude sees them. This reduces n
 When enabled, Code Refinery will automatically merge PRs that receive an `approve` verdict (zero critical or warning findings after filtering).
 
 ```yaml
-- uses: your-org/code-refinery@v1
+- uses: iemarjay/code-refinery@v1
   with:
     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
     auto_merge: true

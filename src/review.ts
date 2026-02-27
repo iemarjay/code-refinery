@@ -7,6 +7,7 @@ import { invokeClaude } from "./claude";
 import { buildSecurityPrompt, buildCodeQualityPrompt, buildUserContext } from "./prompts";
 import { isTrivialPR } from "./trivial";
 import { filterFindings } from "./filter";
+import { setupGitHubToken } from "./auth";
 
 // ---------------------------------------------------------------------------
 // Config helpers (unchanged)
@@ -308,6 +309,17 @@ async function main(): Promise<void> {
   } catch {
     console.error("Claude Code CLI is not installed or not in PATH. Install with: npm install -g @anthropic-ai/claude-code");
     process.exit(1);
+  }
+
+  // ── Step 0.5: Resolve GitHub App token via OIDC exchange ─────────────
+  console.log("\nSetting up GitHub App token via OIDC exchange...");
+  try {
+    const appToken = await setupGitHubToken();
+    process.env.GH_TOKEN = appToken;
+    console.log("  App token obtained. Comments will appear as code-refinery bot.");
+  } catch (err) {
+    console.warn(`  OIDC token exchange failed: ${(err as Error).message}`);
+    console.warn("  Falling back to default GITHUB_TOKEN.");
   }
 
   // ── Step 1: Fetch PR data and diff ────────────────────────────────────

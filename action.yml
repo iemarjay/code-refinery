@@ -56,7 +56,6 @@ inputs:
   use_foundry:
     description: "Use Azure Foundry as provider"
     default: "false"
-
 outputs:
   findings_count:
     description: "Total number of findings after filtering"
