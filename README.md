@@ -15,6 +15,10 @@ Automated PR review for GitHub -- two dedicated passes (security + code quality)
 - **Branded bot identity** -- comments appear as **code-refinery [bot]** via automatic OIDC token exchange (zero config)
 - **Zero runtime dependencies** -- uses `gh` CLI (pre-installed on runners) for all GitHub API calls
 
+## Prerequisites
+
+Install the [Code Refinery GitHub App](https://github.com/apps/code-refinery) on your repository. This is required for the branded bot identity -- review comments will appear as **code-refinery [bot]** instead of the default GitHub Actions bot.
+
 ## Quick Start
 
 ```yaml
