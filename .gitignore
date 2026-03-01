@@ -1,5 +1,8 @@
 node_modules/
-.claude/
+.claude/*
+!.claude/commands/
+!.claude/agents/
+!.claude/settings.json
 vendor/
 dist/
 !dist/review.js

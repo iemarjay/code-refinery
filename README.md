@@ -14,6 +14,7 @@ Automated PR review for GitHub -- two dedicated passes (security + code quality)
 - **Inline comments** -- critical and warning findings posted directly on the relevant diff lines
 - **Branded bot identity** -- comments appear as **code-refinery [bot]** via automatic OIDC token exchange (zero config)
 - **Zero runtime dependencies** -- uses `gh` CLI (pre-installed on runners) for all GitHub API calls
+- **Local slash commands** -- `/review-changes` and `/review-project` for Claude Code, installable into any project
 
 ## Prerequisites
 
@@ -274,6 +275,85 @@ Requirements and behavior:
 - Respects branch protection rules. If the repository requires additional status checks or reviewer approvals, the merge will fail gracefully and the action logs the reason.
 - Posts a comment noting the auto-merge before executing it.
 - Best used alongside `fail_on_critical: true` for a complete gate.
+
+## Local Slash Commands
+
+Two Claude Code slash commands for local review — usable standalone, no GitHub Action required:
+
+- **`/review-changes`** -- reviews only your pending branch changes (git diff vs `origin/HEAD`), with a parallel false-positive filter pass
+- **`/review-project`** -- full project scan across all source files, not limited to a diff; scopes to a subdirectory with an optional argument
+
+### Install into your project
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iemarjay/code-refinery/main/install-commands.sh | bash
+```
+
+This adds four files to your project:
+
+```
+.claude/
+  commands/
+    review-changes.md   — review pending branch changes vs origin/HEAD
+    review-project.md   — scan the entire project (or a subdirectory)
+  agents/
+    security-reviewer.md
+    code-quality-reviewer.md
+```
+
+It also updates your `.gitignore` so the commands are committed to your repo and shared with your team.
+
+### Usage
+
+```bash
+# Review what you've changed on your branch (before pushing)
+claude /review-changes
+
+# Scan the entire project
+claude /review-project
+
+# Scan a specific directory
+claude /review-project src/auth/
+```
+
+### Prerequisites
+
+[Claude Code CLI](https://docs.anthropic.com/claude-code) must be installed and authenticated:
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude login   # Pro/Max subscription
+# or: export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Output
+
+Both commands print a verdict header first, then collapsible findings grouped by severity:
+
+**`/review-changes`**
+```
+## ❌ request_changes — 2 critical, 1 warning, 0 info
+
+| | Critical | Warning | Info |
+|---|:---:|:---:|:---:|
+| Security | 1 | 0 | 0 |
+| Code Quality | 1 | 1 | 0 |
+```
+
+**`/review-project`**
+```
+## ⚠️ comment — 0 critical, 3 warning, 1 info
+
+Scan scope: src/auth/
+Files reviewed: 12 source files
+
+| | Critical | Warning | Info |
+|---|:---:|:---:|:---:|
+| Security | 0 | 2 | 1 |
+| Code Quality | 0 | 1 | 0 |
+```
+
+---
 
 ## How It Works
 
