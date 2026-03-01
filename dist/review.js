@@ -1446,7 +1446,7 @@ Verdict: ${verdict}`);
     console.warn(`Failed to post inline review: ${err.message}`);
   }
   let mergeResult;
-  if (config.autoMerge && verdict === "approve") {
+  if (config.autoMerge && verdict !== "request_changes") {
     console.log(`
 Auto-merging PR (method: ${config.autoMergeMethod})...`);
     mergeResult = mergePR(config.repo, config.prNumber, config.autoMergeMethod);

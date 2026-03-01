@@ -464,7 +464,7 @@ async function main(): Promise<void> {
 
   // ── Step 10: Auto-merge if applicable ─────────────────────────────────
   let mergeResult: MergeResult | undefined;
-  if (config.autoMerge && verdict === "approve") {
+  if (config.autoMerge && verdict !== "request_changes") {
     console.log(`\nAuto-merging PR (method: ${config.autoMergeMethod})...`);
     mergeResult = mergePR(config.repo, config.prNumber, config.autoMergeMethod);
     if (mergeResult.merged) {
