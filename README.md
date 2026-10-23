@@ -395,4 +395,4 @@ False positive filtering applies hard rules ported from Anthropic's security rev
 
 ## License
 
-MIT
+[MIT](LICENSE). Portions are adapted from Anthropic's MIT-licensed [claude-code-security-review](https://github.com/anthropics/claude-code-security-review); see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

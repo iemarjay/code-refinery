@@ -1,6 +1,7 @@
 {
   "name": "code-refinery",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "build": "esbuild src/review.ts --bundle --platform=node --target=node20 --outfile=dist/review.js",
     "typecheck": "tsc --noEmit"
