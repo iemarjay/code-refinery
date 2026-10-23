@@ -29,8 +29,134 @@ var import_child_process3 = require("child_process");
 
 // src/github.ts
 var import_child_process = require("child_process");
+
+// src/diff.ts
+var MAX_SNAP_DISTANCE = 10;
+function commentableLines(patch) {
+  const lines = /* @__PURE__ */ new Set();
+  if (!patch) return lines;
+  let right = 0;
+  let inHunk = false;
+  for (const raw of patch.split("\n")) {
+    const hunk = raw.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      right = Number(hunk[1]);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (raw.startsWith("+") || raw.startsWith(" ")) {
+      lines.add(right);
+      right++;
+    }
+  }
+  return lines;
+}
+function snapToDiff(line, commentable) {
+  if (commentable.has(line)) return line;
+  for (let d = 1; d <= MAX_SNAP_DISTANCE; d++) {
+    if (commentable.has(line - d)) return line - d;
+    if (commentable.has(line + d)) return line + d;
+  }
+  return null;
+}
+
+// src/dedupe.ts
+var NEARBY_LINES = 5;
+var MIN_TEXT_OVERLAP = 0.35;
+var SEVERITY_RANK = { critical: 3, warning: 2, info: 1 };
+var STOPWORDS = /* @__PURE__ */ new Set([
+  "the",
+  "and",
+  "this",
+  "that",
+  "with",
+  "from",
+  "when",
+  "which",
+  "into",
+  "only",
+  "line",
+  "code",
+  "value",
+  "values",
+  "call",
+  "calls",
+  "called",
+  "because",
+  "before",
+  "after",
+  "while",
+  "would",
+  "could",
+  "should",
+  "there",
+  "their",
+  "every",
+  "other",
+  "than",
+  "then",
+  "does",
+  "also",
+  "same",
+  "were",
+  "been",
+  "being",
+  "have",
+  "here"
+]);
+function tokens(text) {
+  const out = /* @__PURE__ */ new Set();
+  for (const t of text.toLowerCase().match(/[a-z_][a-z0-9_.]{3,}/g) ?? []) {
+    if (!STOPWORDS.has(t)) out.add(t);
+  }
+  return out;
+}
+function overlap(a, b) {
+  const ta = tokens(a);
+  const tb = tokens(b);
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let shared = 0;
+  for (const t of ta) if (tb.has(t)) shared++;
+  return shared / Math.min(ta.size, tb.size);
+}
+function normalizeCategory(category) {
+  return category.toLowerCase().replace(/[^a-z]/g, "");
+}
+function isSameIssue(a, b) {
+  if (a.file !== b.file) return false;
+  if (a.line === b.line) return true;
+  if (Math.abs(a.line - b.line) > NEARBY_LINES) return false;
+  return normalizeCategory(a.category) === normalizeCategory(b.category) || overlap(a.description, b.description) >= MIN_TEXT_OVERLAP;
+}
+function better(a, b) {
+  const rank = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity];
+  if (rank !== 0) return rank > 0 ? a : b;
+  return a.confidence >= b.confidence ? a : b;
+}
+function dedupeFindings(findings) {
+  const kept = [];
+  for (const finding of findings) {
+    const idx = kept.findIndex((k) => isSameIssue(k, finding));
+    if (idx === -1) {
+      kept.push(finding);
+      continue;
+    }
+    const winner = better(kept[idx], finding);
+    const loser = winner === finding ? kept[idx] : finding;
+    console.log(
+      `  [dedupe] ${loser.file}:${loser.line} (${loser.pass_type}/${loser.category}) duplicates ${winner.file}:${winner.line} (${winner.pass_type}/${winner.category})`
+    );
+    kept[idx] = winner;
+  }
+  return kept;
+}
+
+// src/github.ts
 var REVIEW_MARKER = "<!-- code-refinery-review -->";
-function ghApi(endpoint, method = "GET", data, headers) {
+var FINDING_MARKER = "<!-- code-refinery-finding -->";
+var LEGACY_FINDING_FOOTER = "| Code Refinery</sub>";
+function ghApi(endpoint, method = "GET", data, headers, token) {
   const args = ["api", endpoint, "--method", method];
   if (headers) {
     for (const [key, value] of Object.entries(headers)) {
@@ -44,7 +170,8 @@ function ghApi(endpoint, method = "GET", data, headers) {
     encoding: "utf-8",
     input: data ? JSON.stringify(data) : void 0,
     stdio: ["pipe", "pipe", "pipe"],
-    timeout: 3e4
+    timeout: 3e4,
+    env: token ? { ...process.env, GH_TOKEN: token } : process.env
   });
   if (!result || !result.trim()) {
     return null;
@@ -99,7 +226,8 @@ function formatFindingComment(finding) {
 `;
   }
   body += `
-<sub>confidence: ${finding.confidence} | Code Refinery</sub>`;
+<sub>confidence: ${finding.confidence} | Code Refinery</sub>
+${FINDING_MARKER}`;
   return body;
 }
 function findExistingComment(repo, prNumber) {
@@ -176,7 +304,46 @@ ${body}`;
   });
   console.log("Posted new summary comment.");
 }
-function postInlineReview(repo, prNumber, headSha, findings, prFiles) {
+function isFindingComment(body) {
+  return !!body && (body.includes(FINDING_MARKER) || body.includes(LEGACY_FINDING_FOOTER));
+}
+function getPriorThreads(repo, prNumber) {
+  const comments = [];
+  try {
+    for (let page = 1; page <= 10; page++) {
+      const batch = ghApi(
+        `/repos/${repo}/pulls/${prNumber}/comments?per_page=100&page=${page}`
+      );
+      if (!batch || batch.length === 0) break;
+      comments.push(...batch);
+      if (batch.length < 100) break;
+    }
+  } catch (err) {
+    console.warn("Failed to fetch prior review comments.", err.message);
+    return [];
+  }
+  const threads = /* @__PURE__ */ new Map();
+  for (const c of comments) {
+    if (c.in_reply_to_id || !isFindingComment(c.body)) continue;
+    const header = c.body.match(/\*\*(?:Security|Code Quality): ([^*]+)\*\*/);
+    threads.set(c.id, {
+      file: c.path,
+      line: c.line ?? c.original_line ?? 0,
+      category: header?.[1]?.trim() ?? "",
+      description: c.body,
+      outdated: c.line === null,
+      replies: []
+    });
+  }
+  for (const c of comments) {
+    const thread = c.in_reply_to_id ? threads.get(c.in_reply_to_id) : void 0;
+    if (thread && c.body) {
+      thread.replies.push({ user: c.user?.login ?? "unknown", body: c.body });
+    }
+  }
+  return [...threads.values()];
+}
+function postInlineReview(repo, prNumber, headSha, findings, prFiles, priorThreads = []) {
   const inlineFindings = findings.filter(
     (f) => f.severity === "critical" || f.severity === "warning"
   );
@@ -189,6 +356,7 @@ function postInlineReview(repo, prNumber, headSha, findings, prFiles) {
     fileMap.set(file.filename, file);
   }
   const reviewComments = [];
+  const offDiff = [];
   for (const finding of inlineFindings) {
     if (!fileMap.has(finding.file)) {
       console.log(
@@ -196,34 +364,51 @@ function postInlineReview(repo, prNumber, headSha, findings, prFiles) {
       );
       continue;
     }
-    reviewComments.push({
-      path: finding.file,
-      line: finding.line,
-      side: "RIGHT",
-      body: formatFindingComment(finding)
-    });
+    if (priorThreads.some((t) => isSameIssue(t, finding))) {
+      console.log(
+        `Already commented on ${finding.file}:${finding.line} in an earlier run, not re-posting.`
+      );
+      continue;
+    }
+    const line = snapToDiff(finding.line, commentableLines(fileMap.get(finding.file).patch));
+    if (line === null) {
+      offDiff.push(finding);
+      continue;
+    }
+    let body = formatFindingComment(finding);
+    if (line !== finding.line) {
+      body = `_Refers to line ${finding.line}, which is outside the diff._
+
+${body}`;
+    }
+    reviewComments.push({ path: finding.file, line, side: "RIGHT", body });
   }
-  if (reviewComments.length === 0) {
-    console.log("No findings map to files in the PR diff.");
+  if (reviewComments.length === 0 && offDiff.length === 0) {
+    console.log("No new inline findings to post.");
     return;
   }
+  const reviewBody = offDiff.map((f) => `**\`${f.file}:${f.line}\`** (outside the diff)
+
+${formatFindingComment(f)}`).join("\n\n---\n\n");
   try {
     ghApi(`/repos/${repo}/pulls/${prNumber}/reviews`, "POST", {
       commit_id: headSha,
       event: "COMMENT",
+      ...reviewBody ? { body: reviewBody } : {},
       comments: reviewComments
     });
     console.log(
-      `Posted batch review with ${reviewComments.length} inline comments.`
+      `Posted batch review with ${reviewComments.length} inline comments` + (offDiff.length ? ` and ${offDiff.length} outside-diff finding(s) in the review body.` : ".")
     );
     return;
   } catch (err) {
     console.warn(
-      "Batch review failed (line numbers may be outside diff context). Falling back to individual comments.",
+      "Batch review failed. Falling back to individual comments.",
       err.message
     );
   }
   let posted = 0;
+  const unposted = reviewBody ? [reviewBody] : [];
   for (const comment of reviewComments) {
     try {
       ghApi(`/repos/${repo}/pulls/${prNumber}/comments`, "POST", {
@@ -236,20 +421,45 @@ function postInlineReview(repo, prNumber, headSha, findings, prFiles) {
       posted++;
     } catch {
       console.warn(
-        `Could not post comment on ${comment.path}:${comment.line} \u2014 line may not be in diff context.`
+        `Could not post comment on ${comment.path}:${comment.line}, moving it to the review body.`
       );
+      unposted.push(`**\`${comment.path}:${comment.line}\`**
+
+${comment.body}`);
     }
   }
   console.log(
     `Posted ${posted}/${reviewComments.length} individual inline comments.`
   );
+  if (unposted.length > 0) {
+    try {
+      ghApi(`/repos/${repo}/pulls/${prNumber}/reviews`, "POST", {
+        commit_id: headSha,
+        event: "COMMENT",
+        body: unposted.join("\n\n---\n\n")
+      });
+      console.log("Posted remaining findings in a review body.");
+    } catch (err) {
+      console.warn("Failed to post review body.", err.message);
+    }
+  }
 }
-function mergePR(repo, prNumber, method) {
+function mergePR(repo, prNumber, method, fallbackToken) {
+  const result = tryMerge(repo, prNumber, method);
+  if (!result.merged && result.forbidden && fallbackToken && fallbackToken !== (process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN)) {
+    console.log("  App token cannot merge, retrying with the workflow token...");
+    return tryMerge(repo, prNumber, method, fallbackToken);
+  }
+  return result;
+}
+function tryMerge(repo, prNumber, method, token) {
   try {
     const response = ghApi(
       `/repos/${repo}/pulls/${prNumber}/merge`,
       "PUT",
-      { merge_method: method }
+      { merge_method: method },
+      void 0,
+      token
     );
     return {
       merged: true,
@@ -273,6 +483,7 @@ function mergePR(repo, prNumber, method) {
     if (message.includes("403")) {
       return {
         merged: false,
+        forbidden: true,
         message: "Forbidden: the provided token does not have permission to merge this PR."
       };
     }
@@ -346,9 +557,47 @@ var EMPTY_RESULT = {
   }
 };
 function sleep(ms) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-  }
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function runClaude(args, input, cwd, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = (0, import_child_process2.spawn)("claude", args, { cwd, stdio: ["pipe", "pipe", "pipe"], detached: true });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const killGroup = (signal) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal);
+      } catch {
+      }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup("SIGTERM");
+      setTimeout(() => killGroup("SIGKILL"), 5e3).unref();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      finish({ stdout, stderr, status: null, timedOut });
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => finish({ stdout, stderr, status: null, timedOut, spawnError: err }));
+    child.on("close", (status) => finish({ stdout, stderr, status, timedOut }));
+    child.stdin.on("error", () => {
+    });
+    child.stdin.end(input);
+  });
 }
 function isPromptTooLong(stdout) {
   try {
@@ -358,7 +607,7 @@ function isPromptTooLong(stdout) {
     return false;
   }
 }
-function parseClaudeOutput(stdout) {
+function parseClaudeOutput(stdout, log) {
   const envelope = JSON.parse(stdout);
   if (envelope.structured_output) {
     return envelope.structured_output;
@@ -369,10 +618,10 @@ function parseClaudeOutput(stdout) {
       return parsed;
     }
   }
-  console.warn("Claude output missing structured_output and result fields.");
+  log("Claude output missing structured_output and result fields.");
   return EMPTY_RESULT;
 }
-function invokeClaude(options) {
+async function invokeClaude(options) {
   const {
     prompt,
     systemPrompt,
@@ -381,8 +630,12 @@ function invokeClaude(options) {
     maxTurns,
     maxBudgetUsd,
     timeoutMinutes,
-    disallowedTools = "Bash(ps:*)"
+    disallowedTools = "Bash(ps:*)",
+    label
   } = options;
+  const prefix = label ? `  [${label}] ` : "";
+  const warn = (msg) => console.warn(prefix + msg);
+  const error = (msg) => console.error(prefix + msg);
   const args = [
     "--output-format",
     "json",
@@ -403,43 +656,31 @@ function invokeClaude(options) {
   }
   const timeoutMs = timeoutMinutes * 60 * 1e3;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      const stdout = (0, import_child_process2.execFileSync)("claude", args, {
-        input: prompt,
-        cwd: repoDir,
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: timeoutMs
-      });
-      if (isPromptTooLong(stdout)) {
-        console.warn("Claude reported prompt is too long.");
-        return { output: EMPTY_RESULT, promptTooLong: true };
-      }
-      return { output: parseClaudeOutput(stdout), promptTooLong: false };
-    } catch (err) {
-      const error = err;
-      if (error.stdout && isPromptTooLong(error.stdout)) {
-        console.warn("Claude reported prompt is too long.");
-        return { output: EMPTY_RESULT, promptTooLong: true };
-      }
-      const isTimeout = error.code === "ETIMEDOUT" || error.message?.includes("TIMEOUT");
-      const isLastAttempt = attempt === MAX_RETRIES - 1;
-      if (isTimeout) {
-        console.error(`Claude CLI timed out after ${timeoutMinutes} minutes.`);
-        return { output: EMPTY_RESULT, promptTooLong: false };
-      }
-      if (isLastAttempt) {
-        console.error(
-          `Claude CLI failed after ${MAX_RETRIES} attempts (exit ${error.status ?? "unknown"}): ${error.stderr?.slice(0, 500) || error.message}`
-        );
-        return { output: EMPTY_RESULT, promptTooLong: false };
-      }
-      const delayMs = RETRY_DELAY_MS * (attempt + 1);
-      console.warn(
-        `Claude CLI attempt ${attempt + 1} failed (exit ${error.status ?? "unknown"}), retrying in ${delayMs / 1e3}s...`
-      );
-      sleep(delayMs);
+    const run = await runClaude(args, prompt, repoDir, timeoutMs);
+    if (isPromptTooLong(run.stdout)) {
+      warn("Claude reported prompt is too long.");
+      return { output: EMPTY_RESULT, promptTooLong: true };
     }
+    if (run.timedOut) {
+      error(`Claude CLI timed out after ${timeoutMinutes} minutes.`);
+      return { output: EMPTY_RESULT, promptTooLong: false };
+    }
+    if (run.status === 0 && !run.spawnError) {
+      try {
+        return { output: parseClaudeOutput(run.stdout, warn), promptTooLong: false };
+      } catch (err) {
+        error(`Failed to parse Claude output: ${err.message}`);
+        return { output: EMPTY_RESULT, promptTooLong: false };
+      }
+    }
+    const detail = run.spawnError?.message || run.stderr.slice(0, 500) || run.stdout.slice(0, 500);
+    if (attempt === MAX_RETRIES - 1) {
+      error(`Claude CLI failed after ${MAX_RETRIES} attempts (exit ${run.status ?? "unknown"}): ${detail}`);
+      return { output: EMPTY_RESULT, promptTooLong: false };
+    }
+    const delayMs = RETRY_DELAY_MS * (attempt + 1);
+    warn(`Claude CLI attempt ${attempt + 1} failed (exit ${run.status ?? "unknown"}), retrying in ${delayMs / 1e3}s...`);
+    await sleep(delayMs);
   }
   return { output: EMPTY_RESULT, promptTooLong: false };
 }
@@ -758,7 +999,38 @@ Focus on bugs that will actually bite someone. A good code review catches the er
 
 Your final response must contain only the JSON output matching the required schema. Do not include any other text.${formatCustomInstructions(customInstructions)}`;
 }
-function buildUserContext(prData, diff, changedFiles, includeDiff = true) {
+var MAX_PRIOR_THREADS = 30;
+var MAX_FINDING_CHARS = 600;
+var MAX_REPLY_CHARS = 800;
+function clip(text, max) {
+  const clean = text.replace(/<!--[\s\S]*?-->/g, "").replace(/<sub>[\s\S]*?<\/sub>/g, "").trim();
+  return clean.length > max ? clean.slice(0, max) + "\u2026" : clean;
+}
+function buildPriorThreadsSection(threads) {
+  if (threads.length === 0) return "";
+  const shown = threads.slice(-MAX_PRIOR_THREADS);
+  const blocks = shown.map((t, i) => {
+    const where = `${t.file}:${t.line}${t.outdated ? " (outdated \u2014 code has changed since)" : ""}`;
+    const replies = t.replies.length ? t.replies.map((r) => `  Reply from ${r.user}:
+  ${clip(r.body, MAX_REPLY_CHARS).replace(/\n/g, "\n  ")}`).join("\n") : "  (no replies)";
+    return `[${i + 1}] ${where}
+  Finding: ${clip(t.description, MAX_FINDING_CHARS).replace(/\n/g, "\n  ")}
+${replies}`;
+  });
+  return `
+PREVIOUS REVIEW THREADS:
+Earlier Code Refinery runs on this PR left the inline findings below, and the author may have replied. Use them as follows:
+- If a finding has been fixed in the current code, do not report it.
+- If a reply explains why a finding does not apply (for example: the code predates this PR, the behavior is intended, or the author verified it is not exploitable), do not report it again unless you can point to concrete evidence in the current code that the reply is wrong. If you do, say what the reply missed.
+- If a finding is still present and nobody has answered it, report it again with the same file, line and category. It will not be posted twice, but it still counts toward the verdict.
+- Do not let these threads narrow your review. Check the rest of the PR as thoroughly as you otherwise would.
+
+${blocks.join("\n\n")}
+${threads.length > shown.length ? `
+(${threads.length - shown.length} older thread(s) omitted.)
+` : ""}`;
+}
+function buildUserContext(prData, diff, changedFiles, includeDiff = true, priorThreads = []) {
   const filesList = changedFiles.map((f) => `- ${f}`).join("\n");
   let diffSection;
   if (includeDiff) {
@@ -790,7 +1062,7 @@ ${prData.body || "(no description provided)"}
 
 Files changed:
 ${filesList}
-${diffSection}`;
+${buildPriorThreadsSection(priorThreads)}${diffSection}`;
 }
 
 // src/trivial.ts
@@ -1233,7 +1505,7 @@ function formatFindingsSection(label, icon, findings) {
   return lines.join("\n");
 }
 function buildSummaryComment(opts) {
-  const { verdict, findings, securityCompleted, qualityCompleted, filteredCount, mergeResult, trivial } = opts;
+  const { verdict, findings, securityCompleted, qualityCompleted, filteredCount, duplicateCount, mergeResult, trivial } = opts;
   const lines = [];
   if (trivial) {
     lines.push("## Code Refinery Review \u2014 Skipped (Trivial PR)");
@@ -1270,6 +1542,10 @@ function buildSummaryComment(opts) {
   }
   if (filteredCount > 0) {
     lines.push(`<sub>${filteredCount} finding(s) were filtered as likely false positives.</sub>`);
+    lines.push("");
+  }
+  if (duplicateCount) {
+    lines.push(`<sub>${duplicateCount} duplicate finding(s) reported by both passes were merged.</sub>`);
     lines.push("");
   }
   if (mergeResult) {
@@ -1322,6 +1598,7 @@ async function main() {
     console.error("Claude Code CLI is not installed or not in PATH. Install with: npm install -g @anthropic-ai/claude-code");
     process.exit(1);
   }
+  const workflowToken = process.env.GITHUB_TOKEN;
   console.log("\nSetting up GitHub App token via OIDC exchange...");
   try {
     const appToken = await setupGitHubToken();
@@ -1389,50 +1666,58 @@ async function main() {
     setOutputs({ findings_count: "0", critical_count: "0", verdict: "approve" });
     return;
   }
+  const priorThreads = getPriorThreads(config.repo, config.prNumber);
+  if (priorThreads.length > 0) {
+    console.log(`
+Found ${priorThreads.length} review thread(s) from earlier runs.`);
+  }
   const changedFiles = files.map((f) => f.filename);
-  const userContext = buildUserContext(prData, diff, changedFiles);
+  const userContext = buildUserContext(prData, diff, changedFiles, true, priorThreads);
   const repoDir = process.env.GITHUB_WORKSPACE || process.cwd();
-  function runPass(passLabel, systemPrompt) {
+  async function runPass(passLabel, passType, systemPrompt) {
     const baseOpts = {
       systemPrompt,
       repoDir,
       model: config.model,
       maxTurns: config.maxTurns,
       maxBudgetUsd: config.maxBudgetUsd,
-      timeoutMinutes: config.timeoutMinutes
+      timeoutMinutes: config.timeoutMinutes,
+      label: passLabel
     };
-    let result = invokeClaude({ ...baseOpts, prompt: userContext });
+    const started = Date.now();
+    let result = await invokeClaude({ ...baseOpts, prompt: userContext });
     if (result.promptTooLong) {
-      console.warn(`  ${passLabel}: prompt too long, retrying without diff...`);
-      const smallerContext = buildUserContext(prData, diff, changedFiles, false);
-      result = invokeClaude({ ...baseOpts, prompt: smallerContext });
+      console.warn(`  [${passLabel}] prompt too long, retrying without diff...`);
+      const smallerContext = buildUserContext(prData, diff, changedFiles, false, priorThreads);
+      result = await invokeClaude({ ...baseOpts, prompt: smallerContext });
     }
+    for (const f of result.output.findings) {
+      f.pass_type = passType;
+    }
+    const seconds = Math.round((Date.now() - started) / 1e3);
+    console.log(
+      `  [${passLabel}] completed: ${result.output.analysis_summary.review_completed}, findings: ${result.output.findings.length} (${seconds}s)`
+    );
     return result;
   }
-  console.log("\n--- Pass 1: Security Review ---");
-  const securityPrompt = buildSecurityPrompt(config.strictness, config.customInstructions);
-  const securityInvoke = runPass("Security", securityPrompt);
+  console.log("\n--- Running Security and Code Quality passes in parallel ---");
+  const [securityInvoke, qualityInvoke] = await Promise.all([
+    runPass("Security", "security", buildSecurityPrompt(config.strictness, config.customInstructions)),
+    runPass("Code Quality", "code-quality", buildCodeQualityPrompt(config.strictness, config.customInstructions))
+  ]);
   const securityResult = securityInvoke.output;
-  const securityCompleted = securityResult.analysis_summary.review_completed;
-  console.log(`  completed: ${securityCompleted}, findings: ${securityResult.findings.length}`);
-  for (const f of securityResult.findings) {
-    f.pass_type = "security";
-  }
-  console.log("\n--- Pass 2: Code Quality Review ---");
-  const qualityPrompt = buildCodeQualityPrompt(config.strictness, config.customInstructions);
-  const qualityInvoke = runPass("Code Quality", qualityPrompt);
   const qualityResult = qualityInvoke.output;
+  const securityCompleted = securityResult.analysis_summary.review_completed;
   const qualityCompleted = qualityResult.analysis_summary.review_completed;
-  console.log(`  completed: ${qualityCompleted}, findings: ${qualityResult.findings.length}`);
-  for (const f of qualityResult.findings) {
-    f.pass_type = "code-quality";
-  }
   const allFindings = [...securityResult.findings, ...qualityResult.findings];
   console.log(`
 Total raw findings: ${allFindings.length}`);
   console.log("Applying false-positive filters...");
-  const filtered = filterFindings(allFindings);
-  const filteredCount = allFindings.length - filtered.length;
+  const afterFilters = filterFindings(allFindings);
+  const filteredCount = allFindings.length - afterFilters.length;
+  console.log("Merging duplicate findings...");
+  const filtered = dedupeFindings(afterFilters);
+  const duplicateCount = afterFilters.length - filtered.length;
   const criticalCount = filtered.filter((f) => f.severity === "critical").length;
   const warningCount = filtered.filter((f) => f.severity === "warning").length;
   const infoCount = filtered.filter((f) => f.severity === "info").length;
@@ -1441,7 +1726,7 @@ Total raw findings: ${allFindings.length}`);
   console.log(`
 Verdict: ${verdict}`);
   try {
-    postInlineReview(config.repo, config.prNumber, prData.headSha, filtered, files);
+    postInlineReview(config.repo, config.prNumber, prData.headSha, filtered, files, priorThreads);
   } catch (err) {
     console.warn(`Failed to post inline review: ${err.message}`);
   }
@@ -1449,7 +1734,7 @@ Verdict: ${verdict}`);
   if (config.autoMerge && verdict !== "request_changes") {
     console.log(`
 Auto-merging PR (method: ${config.autoMergeMethod})...`);
-    mergeResult = mergePR(config.repo, config.prNumber, config.autoMergeMethod);
+    mergeResult = mergePR(config.repo, config.prNumber, config.autoMergeMethod, workflowToken);
     if (mergeResult.merged) {
       console.log(`  Merged successfully (sha: ${mergeResult.sha}).`);
     } else {
@@ -1462,6 +1747,7 @@ Auto-merging PR (method: ${config.autoMergeMethod})...`);
     securityCompleted,
     qualityCompleted,
     filteredCount,
+    duplicateCount,
     mergeResult
   });
   try {

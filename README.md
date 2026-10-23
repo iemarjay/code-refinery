@@ -271,7 +271,8 @@ When enabled, Code Refinery will automatically merge PRs that receive an `approv
 
 Requirements and behavior:
 
-- Only triggers when verdict is `approve` -- any critical or warning finding blocks the merge.
+- Triggers when the verdict is `approve` or `comment` -- any critical finding blocks the merge.
+- Merges with the code-refinery App token first. If that token is not allowed to merge (HTTP 403), it retries with the workflow's `GITHUB_TOKEN`, so the workflow needs `contents: write`. A merge made with `GITHUB_TOKEN` does not trigger other workflows on the base branch (a GitHub rule), so a deploy-on-push workflow will not run for it.
 - Respects branch protection rules. If the repository requires additional status checks or reviewer approvals, the merge will fail gracefully and the action logs the reason.
 - Posts a comment noting the auto-merge before executing it.
 - Best used alongside `fail_on_critical: true` for a complete gate.
@@ -367,21 +368,22 @@ Fetch PR metadata + unified diff (gh CLI)
 Trivial PR check --> skip if docs/config/lockfiles only
   |
   v
-Pass 1: Security Review
-  Claude in full agentic mode with security-focused system prompt.
+Load earlier review threads + author replies (re-runs on new pushes)
+  |
+  v
+Security Review  +  Code Quality Review   (run in parallel)
+  Claude in full agentic mode, one dedicated system prompt per pass.
   Explores the repo using Read, Grep, Glob tools.
   Returns structured JSON findings via --json-schema.
   |
   v
-Pass 2: Code Quality Review
-  Same agentic mode with code-quality system prompt.
-  Separate invocation for dedicated focus.
-  |
-  v
 Merge findings + false positive filter (hard regex rules)
+  + merge duplicates reported by both passes
   |
   v
-Post inline review comments (critical + warning on diff lines)
+Post inline review comments (critical + warning on diff lines;
+  lines outside the diff snap to the nearest diff line or go in the
+  review body; findings already posted in an earlier run are not repeated)
 Post summary comment (full overview with verdict)
   |
   v

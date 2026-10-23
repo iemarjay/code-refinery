@@ -25,19 +25,18 @@ action.yml (composite GitHub Action)
   │   ├─ Fetch PR data + diff (gh CLI)
   │   ├─ Trivial PR check → skip if docs/config only
   │   │
-  │   ├─ Pass 1: Security Review
-  │   │   └─ claude --output-format json --json-schema '{...}'
-  │   │      --append-system-prompt "{security_prompt}"
-  │   │      (full agentic mode, Sonnet default, prompt via stdin)
+  │   ├─ Load prior review threads + replies (fed into the prompt)
   │   │
-  │   ├─ Pass 2: Code Quality Review
+  │   ├─ Security + Code Quality passes, run concurrently (Promise.all)
   │   │   └─ claude --output-format json --json-schema '{...}'
-  │   │      --append-system-prompt "{quality_prompt}"
+  │   │      --append-system-prompt "{security_prompt | quality_prompt}"
   │   │      (full agentic mode, Sonnet default, prompt via stdin)
   │   │
   │   ├─ Merge findings + false positive filter (hard regex rules + generated file markers)
+  │   ├─ Dedupe findings reported by both passes
   │   │
-  │   ├─ Post inline review comments (critical + warning)
+  │   ├─ Post inline review comments (critical + warning; snapped to diff lines,
+  │   │   skipping findings already posted in an earlier run)
   │   └─ Post summary comment (full overview)
   │
   └─ Set outputs: findings_count, critical_count, verdict
@@ -113,7 +112,10 @@ src/
   schema.ts                   — JSON schema for --json-schema constrained output
   prompts.ts                  — Security prompt, code quality prompt, user context builder
   trivial.ts                  — Trivial PR detection (docs/config/lock files)
-  claude.ts                   — Claude CLI invocation via execFileSync
+  claude.ts                   — Claude CLI invocation via async spawn (passes run concurrently)
+  diff.ts                     — Patch parsing: commentable lines + snapping findings onto them
+  dedupe.ts                   — Cross-pass duplicate detection (isSameIssue, dedupeFindings)
+  auth.ts                     — OIDC → code-refinery GitHub App token exchange
   filter.ts                   — Hard false-positive filtering (regex rules)
   github.ts                   — PR data fetch, inline review posting, summary comment
 dist/
@@ -240,9 +242,20 @@ Compared against Anthropic's vendor examples and closed the gaps.
 
 **Verified:** `npx tsc --noEmit` passes, `npm run build` → `dist/review.js` (49.3kb), `node dist/review.js` exits gracefully.
 
+### Phase 9: Fixes from production use ✅
+Driven by 31 real runs on `iemarjay/xmutual-backend` (Feb–Oct 2026): auto-merge failed 17/17 times, 6 runs lost inline comments to HTTP 422, reviews took ~9 min, both passes reported the same bug, and re-runs could not see the author's replies.
+
+- **Auto-merge token fallback** — `mergePR(repo, pr, method, fallbackToken)` in `src/github.ts`. The App token from OIDC exchange gets 403 on merge; on 403 it retries once with the workflow's `GITHUB_TOKEN` (captured in `review.ts` before `GH_TOKEN` is overwritten). `ghApi` gained an optional `token` param that sets `GH_TOKEN` for that call only.
+- **Diff-line snapping** — `src/diff.ts`: `commentableLines(patch)` parses each file's `patch` into the RIGHT-side lines GitHub accepts; `snapToDiff(line, set)` moves a finding to the nearest such line within 10 lines (comment notes the original line). Findings with no line nearby go into the review body. If the batch review still fails, individually rejected comments are collected into one review body instead of dropped.
+- **Parallel passes** — `invokeClaude` is now async (`spawn`, `detached` process group so a timeout kills Claude's tool subprocesses too; busy-wait sleep removed). `runPass` tags `pass_type`, logs per-pass duration, and both passes run under `Promise.all`. Log lines are prefixed `[Security]` / `[Code Quality]`.
+- **Cross-pass dedupe** — `src/dedupe.ts`: `isSameIssue` = same file and (same line, or ≤5 lines apart with same category or ≥35% identifier overlap in descriptions). `dedupeFindings` keeps the higher severity, then higher confidence. Runs after `filterFindings`; summary shows the merged count.
+- **Prior review threads** — `getPriorThreads()` reads the PR's review comments, picks Code Refinery's (new `<!-- code-refinery-finding -->` marker, or the legacy `| Code Refinery</sub>` footer) and attaches replies. `buildUserContext(..., priorThreads)` adds a PREVIOUS REVIEW THREADS section (max 30 threads, clipped). `postInlineReview` skips findings that `isSameIssue` matches an existing thread. Prompt reasoning: Claude must still *report* unfixed, unanswered findings so they count toward the verdict (otherwise an ignored critical would flip the verdict to approve and auto-merge); we only suppress the duplicate *comment*. Replies that explain a finding away are accepted unless the current code contradicts them, which addresses the "predates this PR" / "verified with a dry run" cases.
+
+**Verified:** `npm run typecheck` passes, `npm run build` → `dist/review.js` (62.2kb). Checked against real xmutual-backend data: PR 33 `user.service.ts:427` (422 in run 39701318398) snaps to 420; PR 24 `customer-fund-holding.repository.ts:138` goes to the review body; dedupe merges exactly the known duplicates (PR 24: 5→4, PR 33: 3→2) and nothing on PRs 22/29; PR 22 yields 8 prior threads, all with replies. Fake `claude` binary: two 3s passes finish in ~3s total; a 1.2s timeout resolves at 1.2s. Not verified live: the merge fallback (needs a real PR merge).
+
 ## Conventions
 
-- `claude` CLI invoked via `execFileSync` — never the SDK, never `-p` print mode
+- `claude` CLI invoked as a subprocess (`spawn`) — never the SDK, never `-p` print mode
 - All GitHub API calls via `gh` CLI — never octokit, never raw fetch
 - Provider config is env-var-only — zero provider-specific code
 - `--json-schema` enforces output structure — never regex-parse Claude output

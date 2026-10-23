@@ -1,4 +1,4 @@
-import type { PRData } from "./types";
+import type { PRData, PriorThread } from "./types";
 
 // ─── Strictness configuration ────────────────────────────────────────
 
@@ -352,7 +352,48 @@ Your final response must contain only the JSON output matching the required sche
 
 // ─── User context (stdin for both passes) ────────────────────────────
 
-export function buildUserContext(prData: PRData, diff: string, changedFiles: string[], includeDiff = true): string {
+// ─── Prior review threads ────────────────────────────────────────────
+
+const MAX_PRIOR_THREADS = 30;
+const MAX_FINDING_CHARS = 600;
+const MAX_REPLY_CHARS = 800;
+
+function clip(text: string, max: number): string {
+  const clean = text.replace(/<!--[\s\S]*?-->/g, "").replace(/<sub>[\s\S]*?<\/sub>/g, "").trim();
+  return clean.length > max ? clean.slice(0, max) + "…" : clean;
+}
+
+function buildPriorThreadsSection(threads: PriorThread[]): string {
+  if (threads.length === 0) return "";
+
+  const shown = threads.slice(-MAX_PRIOR_THREADS);
+  const blocks = shown.map((t, i) => {
+    const where = `${t.file}:${t.line}${t.outdated ? " (outdated — code has changed since)" : ""}`;
+    const replies = t.replies.length
+      ? t.replies.map((r) => `  Reply from ${r.user}:\n  ${clip(r.body, MAX_REPLY_CHARS).replace(/\n/g, "\n  ")}`).join("\n")
+      : "  (no replies)";
+    return `[${i + 1}] ${where}\n  Finding: ${clip(t.description, MAX_FINDING_CHARS).replace(/\n/g, "\n  ")}\n${replies}`;
+  });
+
+  return `
+PREVIOUS REVIEW THREADS:
+Earlier Code Refinery runs on this PR left the inline findings below, and the author may have replied. Use them as follows:
+- If a finding has been fixed in the current code, do not report it.
+- If a reply explains why a finding does not apply (for example: the code predates this PR, the behavior is intended, or the author verified it is not exploitable), do not report it again unless you can point to concrete evidence in the current code that the reply is wrong. If you do, say what the reply missed.
+- If a finding is still present and nobody has answered it, report it again with the same file, line and category. It will not be posted twice, but it still counts toward the verdict.
+- Do not let these threads narrow your review. Check the rest of the PR as thoroughly as you otherwise would.
+
+${blocks.join("\n\n")}
+${threads.length > shown.length ? `\n(${threads.length - shown.length} older thread(s) omitted.)\n` : ""}`;
+}
+
+export function buildUserContext(
+  prData: PRData,
+  diff: string,
+  changedFiles: string[],
+  includeDiff = true,
+  priorThreads: PriorThread[] = [],
+): string {
   const filesList = changedFiles.map((f) => `- ${f}`).join("\n");
 
   let diffSection: string;
@@ -388,5 +429,5 @@ ${prData.body || "(no description provided)"}
 
 Files changed:
 ${filesList}
-${diffSection}`;
+${buildPriorThreadsSection(priorThreads)}${diffSection}`;
 }

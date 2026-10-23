@@ -1,12 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
 import { execFileSync } from "child_process";
-import type { ActionConfig, PRData, PRFile, ReviewFinding, Verdict, MergeResult, ReviewOutput, InvokeResult } from "./types";
-import { getPRData, getPRDiff, postSummaryComment, postInlineReview, mergePR } from "./github";
+import type { ActionConfig, PRData, PRFile, ReviewFinding, Verdict, MergeResult, InvokeResult, PassType, PriorThread } from "./types";
+import { getPRData, getPRDiff, getPriorThreads, postSummaryComment, postInlineReview, mergePR } from "./github";
 import { invokeClaude } from "./claude";
 import { buildSecurityPrompt, buildCodeQualityPrompt, buildUserContext } from "./prompts";
 import { isTrivialPR } from "./trivial";
 import { filterFindings } from "./filter";
+import { dedupeFindings } from "./dedupe";
 import { setupGitHubToken } from "./auth";
 
 // ---------------------------------------------------------------------------
@@ -179,12 +180,13 @@ interface SummaryOptions {
   securityCompleted: boolean;
   qualityCompleted: boolean;
   filteredCount: number;
+  duplicateCount?: number;
   mergeResult?: MergeResult;
   trivial?: boolean;
 }
 
 function buildSummaryComment(opts: SummaryOptions): string {
-  const { verdict, findings, securityCompleted, qualityCompleted, filteredCount, mergeResult, trivial } = opts;
+  const { verdict, findings, securityCompleted, qualityCompleted, filteredCount, duplicateCount, mergeResult, trivial } = opts;
 
   const lines: string[] = [];
 
@@ -236,6 +238,11 @@ function buildSummaryComment(opts: SummaryOptions): string {
   // Filtered count
   if (filteredCount > 0) {
     lines.push(`<sub>${filteredCount} finding(s) were filtered as likely false positives.</sub>`);
+    lines.push("");
+  }
+
+  if (duplicateCount) {
+    lines.push(`<sub>${duplicateCount} duplicate finding(s) reported by both passes were merged.</sub>`);
     lines.push("");
   }
 
@@ -310,6 +317,9 @@ async function main(): Promise<void> {
     console.error("Claude Code CLI is not installed or not in PATH. Install with: npm install -g @anthropic-ai/claude-code");
     process.exit(1);
   }
+
+  // Keep the workflow token: the App token may lack merge permission
+  const workflowToken = process.env.GITHUB_TOKEN;
 
   // ── Step 0.5: Resolve GitHub App token via OIDC exchange ─────────────
   console.log("\nSetting up GitHub App token via OIDC exchange...");
@@ -386,12 +396,17 @@ async function main(): Promise<void> {
   }
 
   // ── Step 4: Build user context ────────────────────────────────────────
+  const priorThreads: PriorThread[] = getPriorThreads(config.repo, config.prNumber);
+  if (priorThreads.length > 0) {
+    console.log(`\nFound ${priorThreads.length} review thread(s) from earlier runs.`);
+  }
+
   const changedFiles = files.map((f) => f.filename);
-  const userContext = buildUserContext(prData, diff, changedFiles);
+  const userContext = buildUserContext(prData, diff, changedFiles, true, priorThreads);
   const repoDir = process.env.GITHUB_WORKSPACE || process.cwd();
 
   // Helper: run a Claude pass with PROMPT_TOO_LONG retry (retries without diff)
-  function runPass(passLabel: string, systemPrompt: string): InvokeResult {
+  async function runPass(passLabel: string, passType: PassType, systemPrompt: string): Promise<InvokeResult> {
     const baseOpts = {
       systemPrompt,
       repoDir,
@@ -399,52 +414,51 @@ async function main(): Promise<void> {
       maxTurns: config.maxTurns,
       maxBudgetUsd: config.maxBudgetUsd,
       timeoutMinutes: config.timeoutMinutes,
+      label: passLabel,
     };
 
-    let result = invokeClaude({ ...baseOpts, prompt: userContext });
+    const started = Date.now();
+    let result = await invokeClaude({ ...baseOpts, prompt: userContext });
 
     if (result.promptTooLong) {
-      console.warn(`  ${passLabel}: prompt too long, retrying without diff...`);
-      const smallerContext = buildUserContext(prData, diff, changedFiles, false);
-      result = invokeClaude({ ...baseOpts, prompt: smallerContext });
+      console.warn(`  [${passLabel}] prompt too long, retrying without diff...`);
+      const smallerContext = buildUserContext(prData, diff, changedFiles, false, priorThreads);
+      result = await invokeClaude({ ...baseOpts, prompt: smallerContext });
     }
 
+    for (const f of result.output.findings) {
+      f.pass_type = passType;
+    }
+
+    const seconds = Math.round((Date.now() - started) / 1000);
+    console.log(
+      `  [${passLabel}] completed: ${result.output.analysis_summary.review_completed}, findings: ${result.output.findings.length} (${seconds}s)`,
+    );
     return result;
   }
 
-  // ── Step 5: Security pass ─────────────────────────────────────────────
-  console.log("\n--- Pass 1: Security Review ---");
-  const securityPrompt = buildSecurityPrompt(config.strictness, config.customInstructions);
-  const securityInvoke = runPass("Security", securityPrompt);
+  // ── Steps 5–6: Security + code quality passes (run concurrently) ─────
+  console.log("\n--- Running Security and Code Quality passes in parallel ---");
+  const [securityInvoke, qualityInvoke] = await Promise.all([
+    runPass("Security", "security", buildSecurityPrompt(config.strictness, config.customInstructions)),
+    runPass("Code Quality", "code-quality", buildCodeQualityPrompt(config.strictness, config.customInstructions)),
+  ]);
   const securityResult = securityInvoke.output;
-  const securityCompleted = securityResult.analysis_summary.review_completed;
-  console.log(`  completed: ${securityCompleted}, findings: ${securityResult.findings.length}`);
-
-  // Tag security findings
-  for (const f of securityResult.findings) {
-    f.pass_type = "security";
-  }
-
-  // ── Step 6: Code quality pass ─────────────────────────────────────────
-  console.log("\n--- Pass 2: Code Quality Review ---");
-  const qualityPrompt = buildCodeQualityPrompt(config.strictness, config.customInstructions);
-  const qualityInvoke = runPass("Code Quality", qualityPrompt);
   const qualityResult = qualityInvoke.output;
+  const securityCompleted = securityResult.analysis_summary.review_completed;
   const qualityCompleted = qualityResult.analysis_summary.review_completed;
-  console.log(`  completed: ${qualityCompleted}, findings: ${qualityResult.findings.length}`);
 
-  // Tag quality findings
-  for (const f of qualityResult.findings) {
-    f.pass_type = "code-quality";
-  }
-
-  // ── Step 7: Merge + filter findings ───────────────────────────────────
+  // ── Step 7: Merge + filter + dedupe findings ──────────────────────────
   const allFindings = [...securityResult.findings, ...qualityResult.findings];
   console.log(`\nTotal raw findings: ${allFindings.length}`);
 
   console.log("Applying false-positive filters...");
-  const filtered = filterFindings(allFindings);
-  const filteredCount = allFindings.length - filtered.length;
+  const afterFilters = filterFindings(allFindings);
+  const filteredCount = allFindings.length - afterFilters.length;
+
+  console.log("Merging duplicate findings...");
+  const filtered = dedupeFindings(afterFilters);
+  const duplicateCount = afterFilters.length - filtered.length;
 
   const criticalCount = filtered.filter((f) => f.severity === "critical").length;
   const warningCount = filtered.filter((f) => f.severity === "warning").length;
@@ -457,7 +471,7 @@ async function main(): Promise<void> {
 
   // ── Step 9: Post inline review comments ───────────────────────────────
   try {
-    postInlineReview(config.repo, config.prNumber, prData.headSha, filtered, files);
+    postInlineReview(config.repo, config.prNumber, prData.headSha, filtered, files, priorThreads);
   } catch (err) {
     console.warn(`Failed to post inline review: ${(err as Error).message}`);
   }
@@ -466,7 +480,7 @@ async function main(): Promise<void> {
   let mergeResult: MergeResult | undefined;
   if (config.autoMerge && verdict !== "request_changes") {
     console.log(`\nAuto-merging PR (method: ${config.autoMergeMethod})...`);
-    mergeResult = mergePR(config.repo, config.prNumber, config.autoMergeMethod);
+    mergeResult = mergePR(config.repo, config.prNumber, config.autoMergeMethod, workflowToken);
     if (mergeResult.merged) {
       console.log(`  Merged successfully (sha: ${mergeResult.sha}).`);
     } else {
@@ -481,6 +495,7 @@ async function main(): Promise<void> {
     securityCompleted,
     qualityCompleted,
     filteredCount,
+    duplicateCount,
     mergeResult,
   });
 

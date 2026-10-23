@@ -64,6 +64,16 @@ export interface MergeResult {
   sha?: string;
 }
 
+// A Code Refinery inline comment from an earlier run, plus its replies
+export interface PriorThread {
+  file: string;
+  line: number;
+  category: string;
+  description: string;
+  outdated: boolean;
+  replies: Array<{ user: string; body: string }>;
+}
+
 export interface InvokeResult {
   output: ReviewOutput;
   promptTooLong: boolean;
